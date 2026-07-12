@@ -39,3 +39,16 @@ def test_covariance_flag_is_documented_for_both_psf_modes(psf, capsys):
     help_text = capsys.readouterr().out
     assert "-V" in help_text
     assert "--covariance" in help_text
+    assert "--jacobian-backend" in help_text
+    assert "--jax-wavelength-batching" in help_text
+    assert "--no-jax-wavelength-batching" in help_text
+
+
+def test_jax_wavelength_batching_help_describes_default(capsys):
+    with pytest.raises(SystemExit) as excinfo:
+        main(["--help"])
+
+    assert excinfo.value.code == 0
+    output = capsys.readouterr().out
+    assert "Use locked 128-wavelength JAX batches" in output
+    assert "Disable JAX wavelength batching" in output

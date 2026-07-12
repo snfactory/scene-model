@@ -5,6 +5,7 @@ import pytest
 
 from scene_model.jax_scene import (
     CLASSIC_PARAMETER_NAMES,
+    batched_flux_jacobian,
     build_classic_fixed_arrays,
     build_polynomial_background_bases,
     classic_flux,
@@ -152,6 +153,26 @@ def test_classic_named_parameter_reordering_preserves_flux_and_jacobian():
     np.testing.assert_array_equal(permuted_flux, canonical_flux)
     np.testing.assert_array_equal(
         permuted_jacobian, canonical_jacobian[:, permutation]
+    )
+
+
+def test_classic_batched_jacobian_matches_unbatched_map():
+    pytest.importorskip("jax")
+    _, _, _, _, values, fixed = _classic_fixture()
+
+    flux, jacobian = batched_flux_jacobian(
+        values, CLASSIC_PARAMETER_NAMES, fixed,
+        profile="classic", wavelength_batch=2,
+    )
+
+    np.testing.assert_allclose(
+        flux, classic_flux(values, CLASSIC_PARAMETER_NAMES, fixed),
+        rtol=1e-13, atol=0.0,
+    )
+    np.testing.assert_allclose(
+        jacobian,
+        classic_flux_jacobian(values, CLASSIC_PARAMETER_NAMES, fixed),
+        rtol=1e-13, atol=1e-13,
     )
 
 

@@ -72,6 +72,18 @@ if __name__ == "__main__":
     parser.add_option("-V", "--covariance", action="store_true",
                       default=False,
                       help="Propagate scene-fit flux covariance (PSF only)")
+    parser.add_option("--jacobian-backend",
+                      choices=('finite-difference', 'jax'),
+                      default='finite-difference',
+                      help="Flux-covariance Jacobian backend "
+                      "(finite-difference|jax) [%default]")
+    parser.add_option("--jax-wavelength-batching",
+                      dest="jax_wavelength_batching", action="store_true",
+                      default=True,
+                      help="Use locked 128-wavelength JAX batches [%default]")
+    parser.add_option("--no-jax-wavelength-batching",
+                      dest="jax_wavelength_batching", action="store_false",
+                      help="Disable JAX wavelength batching")
     parser.add_option("--filterVariance", dest="filter_variance",
                       action="store_true", help="Apply a filter in wavelength "
                       "to the variance estimate to avoid Poisson biases.",
@@ -136,7 +148,6 @@ if __name__ == "__main__":
 
     if opts.seeingPrior and not opts.usePriors:
         parser.error("Seeing prior requires prior usage (--usePriors > 0).")
-
     # Import the legacy SNfactory compatibility layer only after parsing and
     # validation, so metadata and usage errors do not require the runtime
     # adapter to be installed.
@@ -212,8 +223,16 @@ if __name__ == "__main__":
         fitter.meta_cube_model.WR_3d_fits(model_path, header=[])
 
     # Extract the point source spectrum
+    if (opts.covariance and opts.jacobian_backend == 'jax' and
+            opts.jax_wavelength_batching):
+        from scene_model.jax_scene import PRODUCTION_WAVELENGTH_BATCH
+        jax_wavelength_batch = PRODUCTION_WAVELENGTH_BATCH
+    else:
+        jax_wavelength_batch = None
     fitter.extract(method=opts.method, radius=opts.radius,
-                   covariance=opts.covariance)
+                   covariance=opts.covariance,
+                   jacobian_backend=opts.jacobian_backend,
+                   jax_wavelength_batch=jax_wavelength_batch)
 
     # Write the point source and background spectra to fits files.
     fitter.write_spectrum(opts.out, opts.sky)
