@@ -7,7 +7,7 @@ global-parameter Jacobian without tracing the mutable model element graph.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, replace
 from functools import lru_cache
 
 import numpy as np
@@ -49,6 +49,7 @@ FOURIER_PROFILE_NAMES = (
 
 REFERENCE_WAVELENGTH = 5000.0
 NATIVE_SPAXELS = 225
+PRODUCTION_WAVELENGTH_BATCH = 128
 
 
 def _readonly_array(value, dtype=np.float64):
@@ -702,3 +703,50 @@ def fourier_flux_jacobian(parameter_values, parameter_names, fixed):
     jacobian = np.empty_like(canonical_jacobian)
     jacobian[:, canonical_indices] = canonical_jacobian
     return jacobian
+
+
+def _fixed_wavelength_slice(fixed, start, stop):
+    """Return one immutable wavelength slice while sharing fixed grids."""
+    return replace(
+        fixed,
+        data=fixed.data[start:stop],
+        inverse_variance=fixed.inverse_variance[start:stop],
+        wavelengths=fixed.wavelengths[start:stop],
+        adr_scale=fixed.adr_scale[start:stop],
+    )
+
+
+def batched_flux_jacobian(parameter_values, parameter_names, fixed,
+                          *, profile,
+                          wavelength_batch=PRODUCTION_WAVELENGTH_BATCH):
+    """Evaluate production flux and its Jacobian in bounded wavelength batches.
+
+    Native coefficient solves are independent between wavelengths.  Batching
+    therefore changes only peak JAX tangent storage, not the extraction map.
+    """
+    wavelength_batch = int(wavelength_batch)
+    if wavelength_batch < 1:
+        raise SceneModelException("JAX wavelength batch must be positive")
+    if profile == "classic":
+        flux_function = classic_flux
+        jacobian_function = classic_flux_jacobian
+    elif profile == "fourier":
+        flux_function = fourier_flux
+        jacobian_function = fourier_flux_jacobian
+    else:
+        raise SceneModelException("Unknown JAX scene profile %s" % profile)
+
+    flux_parts = []
+    jacobian_parts = []
+    for start in range(0, len(fixed.wavelengths), wavelength_batch):
+        stop = min(start + wavelength_batch, len(fixed.wavelengths))
+        batch = _fixed_wavelength_slice(fixed, start, stop)
+        flux_parts.append(flux_function(
+            parameter_values, parameter_names, batch
+        ))
+        jacobian_parts.append(jacobian_function(
+            parameter_values, parameter_names, batch
+        ))
+    if not flux_parts:
+        raise SceneModelException("JAX scene extraction has no wavelengths")
+    return np.concatenate(flux_parts), np.concatenate(jacobian_parts, axis=0)

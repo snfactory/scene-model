@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import redirect_stdout
+import gc
 import hashlib
 import json
 import os
@@ -25,6 +26,7 @@ import time
 import numpy as np
 
 from scene_model.snifs import SnifsCubeFitter
+from scene_model.jax_scene import PRODUCTION_WAVELENGTH_BATCH
 
 
 COLD_RUNTIME_LIMIT = 5.0
@@ -48,7 +50,7 @@ def _peak_rss_bytes():
     return int(value if platform.system() == "Darwin" else value * 1024)
 
 
-def _fit(path, psf, covariance):
+def _fit(path, psf, covariance, batched=False):
     fitter = SnifsCubeFitter(
         str(path), psf=psf, background_degree=0,
         subsampling=3, border=15, least_squares=False,
@@ -60,16 +62,19 @@ def _fit(path, psf, covariance):
     fitter.extract(
         method="psf", covariance=covariance,
         jacobian_backend="jax" if covariance else "finite-difference",
+        jax_wavelength_batch=(
+            PRODUCTION_WAVELENGTH_BATCH if covariance and batched else None
+        ),
     )
     return fitter
 
 
-def _timed_fit(path, psf, covariance):
+def _timed_fit(path, psf, covariance, batched=False):
     started = time.perf_counter()
     # Legacy scene-model reports progress with print().  Keep worker stdout a
     # single JSON document so the parent cannot accidentally parse log text.
     with redirect_stdout(sys.stderr):
-        fitter = _fit(path, psf, covariance)
+        fitter = _fit(path, psf, covariance, batched=batched)
     return fitter, time.perf_counter() - started
 
 
@@ -100,16 +105,32 @@ def _validate_covariance(fitter):
     return provenance
 
 
-def _worker(path, channel, psf):
+def _worker(path, channel, psf, batched=False):
     legacy, legacy_seconds = _timed_fit(path, psf, covariance=False)
-    cold, cold_seconds = _timed_fit(path, psf, covariance=True)
-    warm, warm_seconds = _timed_fit(path, psf, covariance=True)
+    phase_rss = {"legacy_fit": _peak_rss_bytes()}
+    legacy_flux = np.array(legacy.point_source_spectrum.data, copy=True)
+    del legacy
+    gc.collect()
 
-    legacy_flux = np.asarray(legacy.point_source_spectrum.data)
-    cold_flux = np.asarray(cold.point_source_spectrum.data)
-    warm_flux = np.asarray(warm.point_source_spectrum.data)
+    cold, cold_seconds = _timed_fit(
+        path, psf, covariance=True, batched=batched
+    )
+    phase_rss["jax_cold_fit"] = _peak_rss_bytes()
+    cold_flux = np.array(cold.point_source_spectrum.data, copy=True)
     cold_provenance = _validate_covariance(cold)
+    phase_rss["jax_cold_validation"] = _peak_rss_bytes()
+    del cold
+    gc.collect()
+
+    warm, warm_seconds = _timed_fit(
+        path, psf, covariance=True, batched=batched
+    )
+    phase_rss["jax_warm_fit"] = _peak_rss_bytes()
+    warm_flux = np.array(warm.point_source_spectrum.data, copy=True)
     warm_provenance = _validate_covariance(warm)
+    phase_rss["jax_warm_validation"] = _peak_rss_bytes()
+    del warm
+    gc.collect()
     flux_parity = (np.array_equal(legacy_flux, cold_flux)
                    and np.array_equal(legacy_flux, warm_flux))
     provenance_parity = cold_provenance == warm_provenance
@@ -125,6 +146,9 @@ def _worker(path, channel, psf):
     return {
         "channel": channel,
         "psf": psf,
+        "jax_wavelength_batch": (
+            PRODUCTION_WAVELENGTH_BATCH if batched else None
+        ),
         "fixture": {
             "path": str(Path(path).resolve()),
             "sha256": _sha256(path),
@@ -140,6 +164,7 @@ def _worker(path, channel, psf):
             "jax_warm_to_off": warm_ratio,
         },
         "peak_rss_bytes": peak_rss,
+        "peak_rss_by_phase": phase_rss,
         "jax_provenance": cold_provenance,
         "warm_runtime_target_met": warm_ratio < WARM_RUNTIME_TARGET,
         "gates": gates,
@@ -147,11 +172,13 @@ def _worker(path, channel, psf):
     }
 
 
-def _run_child(script, path, channel, psf):
+def _run_child(script, path, channel, psf, batched=False):
     command = [
         sys.executable, str(script), "--worker", "--cube", str(path),
         "--channel", channel, "--psf", psf,
     ]
+    if batched:
+        command.append("--batched")
     completed = subprocess.run(
         command, check=False, text=True, stdout=subprocess.PIPE,
         stderr=sys.stderr,
@@ -194,6 +221,8 @@ def build_parser():
                         help=argparse.SUPPRESS)
     parser.add_argument("--psf", choices=("classic", "fourier"),
                         help=argparse.SUPPRESS)
+    parser.add_argument("--batched", action="store_true",
+                        help="Use the locked 128-wavelength JAX batch")
     return parser
 
 
@@ -202,7 +231,8 @@ def main(argv=None):
     if args.worker:
         if not all((args.cube, args.channel, args.psf)):
             raise ValueError("Worker requires cube, channel, and PSF")
-        print(json.dumps(_worker(args.cube, args.channel, args.psf),
+        print(json.dumps(_worker(
+            args.cube, args.channel, args.psf, batched=args.batched),
                          sort_keys=True))
         return 0
     if not all((args.blue, args.red, args.output)):
@@ -212,7 +242,9 @@ def main(argv=None):
     cases = []
     for channel, path in (("B", args.blue), ("R", args.red)):
         for psf in ("classic", "fourier"):
-            cases.append(_run_child(script, path, channel, psf))
+            cases.append(_run_child(
+                script, path, channel, psf, batched=args.batched
+            ))
     payload = {
         "format": "SNIFS-JAX-SCENE-BENCHMARK-1.0",
         "limits": {
@@ -220,6 +252,9 @@ def main(argv=None):
             "warm_runtime_ratio_target_exclusive": WARM_RUNTIME_TARGET,
             "peak_rss_bytes_exclusive": PEAK_RSS_LIMIT_BYTES,
         },
+        "jax_wavelength_batch": (
+            PRODUCTION_WAVELENGTH_BATCH if args.batched else None
+        ),
         "cases": cases,
         "passed": len(cases) == 4 and all(case["passed"] for case in cases),
     }

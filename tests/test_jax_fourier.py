@@ -6,6 +6,7 @@ import pytest
 from scene_model.jax_scene import (
     FOURIER_PARAMETER_NAMES,
     FOURIER_PROFILE_NAMES,
+    batched_flux_jacobian,
     build_fourier_fixed_arrays,
     build_polynomial_background_bases,
     fourier_flux,
@@ -120,6 +121,26 @@ def test_fourier_named_parameter_reordering_preserves_flux_and_jacobian():
     np.testing.assert_array_equal(permuted_flux, canonical_flux)
     np.testing.assert_array_equal(
         permuted_jacobian, canonical_jacobian[:, permutation]
+    )
+
+
+def test_fourier_batched_jacobian_matches_unbatched_map():
+    pytest.importorskip("jax")
+    _, _, _, _, values, fixed = _fourier_fixture()
+
+    flux, jacobian = batched_flux_jacobian(
+        values, FOURIER_PARAMETER_NAMES, fixed,
+        profile="fourier", wavelength_batch=2,
+    )
+
+    np.testing.assert_allclose(
+        flux, fourier_flux(values, FOURIER_PARAMETER_NAMES, fixed),
+        rtol=1e-13, atol=0.0,
+    )
+    np.testing.assert_allclose(
+        jacobian,
+        fourier_flux_jacobian(values, FOURIER_PARAMETER_NAMES, fixed),
+        rtol=1e-13, atol=1e-13,
     )
 
 

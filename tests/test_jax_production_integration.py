@@ -90,15 +90,23 @@ def _production_fitter(psf):
 
 
 @pytest.mark.parametrize("psf", ["classic", "fourier"])
-def test_production_extraction_uses_requested_jax_backend(psf):
+@pytest.mark.parametrize("wavelength_batch", [None, 128])
+def test_production_extraction_uses_requested_jax_backend(
+        psf, wavelength_batch, capsys):
     pytest.importorskip("jax")
     fitter = _production_fitter(psf)
 
-    fitter.extract(method="psf", covariance=True, jacobian_backend="jax")
+    fitter.extract(
+        method="psf", covariance=True, jacobian_backend="jax",
+        jax_wavelength_batch=wavelength_batch,
+    )
 
     diagnostics = fitter.covariance_diagnostics
     assert diagnostics["derivatives"].backend == "jax"
     assert dict(diagnostics["derivatives"].provenance)["x64"] == "true"
+    assert diagnostics["jax_wavelength_batch"] == wavelength_batch
+    warning = "may change the JAX surrogate and covariance"
+    assert (warning in capsys.readouterr().out) == (wavelength_batch is not None)
     assert diagnostics["jacobian"].shape == (
         len(fitter.cube.lbda), len(fitter.fit_global_parameter_info)
     )

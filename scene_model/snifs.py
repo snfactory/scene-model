@@ -2030,7 +2030,8 @@ class SnifsCubeFitter(object):
                  self.meta_cube.lbda[fit_seeing_widths.argmin()]))
 
     def extract(self, method='psf', radius=None, covariance=False,
-                jacobian_backend='finite-difference', **kwargs):
+                jacobian_backend='finite-difference',
+                jax_wavelength_batch=None, **kwargs):
         """Extract the PSF. See SceneModel.extract for details.
 
         If aperture photometry is being performed, radius is interpreted
@@ -2205,14 +2206,30 @@ class SnifsCubeFitter(object):
                     CLASSIC_PARAMETER_NAMES,
                     FOURIER_PARAMETER_NAMES,
                     FOURIER_PROFILE_NAMES,
+                    PRODUCTION_WAVELENGTH_BATCH,
                     build_classic_fixed_arrays,
                     build_fourier_fixed_arrays,
                     build_polynomial_background_bases,
+                    batched_flux_jacobian,
                     classic_flux,
                     classic_flux_jacobian,
                     fourier_flux,
                     fourier_flux_jacobian,
                 )
+
+                if jax_wavelength_batch not in (
+                        None, PRODUCTION_WAVELENGTH_BATCH):
+                    raise SceneModelException(
+                        "JAX wavelength batching is locked to %d" %
+                        PRODUCTION_WAVELENGTH_BATCH
+                    )
+                if jax_wavelength_batch is not None:
+                    print(
+                        "WARNING: JAX wavelength batching (%d) may change "
+                        "the JAX surrogate and covariance at floating-point "
+                        "roundoff; accepted NumPy flux remains authoritative."
+                        % jax_wavelength_batch
+                    )
 
                 parameter_names = tuple(
                     parameter.name for parameter in
@@ -2239,12 +2256,19 @@ class SnifsCubeFitter(object):
                         adr_scale, evaluation_model.grid_info,
                         background_bases, self.header['EFFTIME'],
                     )
-                    jax_flux = classic_flux(
-                        baseline_values, parameter_names, fixed_jax
-                    )
-                    jacobian = classic_flux_jacobian(
-                        baseline_values, parameter_names, fixed_jax
-                    )
+                    if jax_wavelength_batch is None:
+                        jax_flux = classic_flux(
+                            baseline_values, parameter_names, fixed_jax
+                        )
+                        jacobian = classic_flux_jacobian(
+                            baseline_values, parameter_names, fixed_jax
+                        )
+                    else:
+                        jax_flux, jacobian = batched_flux_jacobian(
+                            baseline_values, parameter_names, fixed_jax,
+                            profile='classic',
+                            wavelength_batch=jax_wavelength_batch,
+                        )
                 elif self.psf == 'fourier':
                     if set(parameter_names) != set(FOURIER_PARAMETER_NAMES):
                         raise SceneModelException(
@@ -2260,12 +2284,19 @@ class SnifsCubeFitter(object):
                         adr_scale, evaluation_model.grid_info,
                         background_bases, profile_constants,
                     )
-                    jax_flux = fourier_flux(
-                        baseline_values, parameter_names, fixed_jax
-                    )
-                    jacobian = fourier_flux_jacobian(
-                        baseline_values, parameter_names, fixed_jax
-                    )
+                    if jax_wavelength_batch is None:
+                        jax_flux = fourier_flux(
+                            baseline_values, parameter_names, fixed_jax
+                        )
+                        jacobian = fourier_flux_jacobian(
+                            baseline_values, parameter_names, fixed_jax
+                        )
+                    else:
+                        jax_flux, jacobian = batched_flux_jacobian(
+                            baseline_values, parameter_names, fixed_jax,
+                            profile='fourier',
+                            wavelength_batch=jax_wavelength_batch,
+                        )
                 else:
                     raise SceneModelException(
                         "JAX covariance does not support PSF %s" % self.psf
@@ -2305,6 +2336,10 @@ class SnifsCubeFitter(object):
                 'fixed_input_shape': tuple(cube_data.shape),
                 'fixed_extraction_map': fixed_extraction_map(
                     coefficient_estimator, amplitude_index
+                ),
+                'jax_wavelength_batch': (
+                    jax_wavelength_batch if jacobian_backend == 'jax'
+                    else None
                 ),
             }
         self.point_source_spectrum = point_source_spectrum

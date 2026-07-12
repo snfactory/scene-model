@@ -40,3 +40,12 @@ def test_covariance_flag_is_documented_for_both_psf_modes(psf, capsys):
     assert "-V" in help_text
     assert "--covariance" in help_text
     assert "--jacobian-backend" in help_text
+    assert "--jax-wavelength-batching" in help_text
+
+
+def test_jax_wavelength_batching_requires_explicit_covariance_backend(capsys):
+    with pytest.raises(SystemExit) as excinfo:
+        main(["--jax-wavelength-batching", "input.fits"])
+
+    assert excinfo.value.code == 2
+    assert "requires --covariance" in capsys.readouterr().err
