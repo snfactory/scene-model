@@ -8,7 +8,8 @@ dynamic = ["version"]
 description = "Scene modeling and point-source extraction for SNIFS IFU data"
 readme = "README.md"
 requires-python = ">=3.10"
-license = { file = "LICENSE" }
+license = "MIT"
+license-files = ["LICENSE", "THIRD_PARTY_LICENSES/*"]
 authors = [
     { name = "Kyle Boone", email = "kboone@berkeley.edu" },
 ]
@@ -26,7 +27,13 @@ extract-star2 = "scene_model.cli:main"
 test = ["pytest>=8"]
 
 [tool.setuptools]
-packages = ["scene_model", "scripts"]
+packages = [
+    "scene_model",
+    "scripts",
+    "ToolBox",
+    "ToolBox.Astro",
+    "pySNIFS",
+]
 
 [tool.setuptools.dynamic]
 version = { attr = "scene_model.config.__version__" }
