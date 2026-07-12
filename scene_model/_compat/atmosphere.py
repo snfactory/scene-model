@@ -171,4 +171,3 @@ class ADR:
         """Return parallactic angle in degrees."""
 
         return RAD2DEG * (self.theta if theta is None else theta)
-

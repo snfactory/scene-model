@@ -31,4 +31,3 @@ def metaslice(alen, nmeta, trim=0, thickness=False):
     imin = trim + ((alen - 2 * trim) % nmeta) // 2
     imax = imin + nmeta * istep
     return [imin, imax, istep]
-

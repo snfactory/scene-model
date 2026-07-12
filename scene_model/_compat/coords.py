@@ -65,4 +65,3 @@ def altaz2hadec(alt, az, phi=19.823056, deg=True):
         ha *= RAD2DEG
         dec *= RAD2DEG
     return ha, dec
-

@@ -10,4 +10,3 @@ def warning2stdout(message, category, filename, lineno, file=None, line=None):
     sys.stdout.write(
         "WARNING: " + warnings.formatwarning(message, category, filename, lineno)
     )
-

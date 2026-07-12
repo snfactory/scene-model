@@ -42,4 +42,3 @@ def errorband(ax, x, y, dy, color="b", alpha=0.3, label="_", **kwargs):
 
 # Preserve the historical import side effect used by scene-model diagnostics.
 Axes.errorband = errorband
-
