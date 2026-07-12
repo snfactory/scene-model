@@ -19,8 +19,9 @@ python validation/benchmark_jax_scene_covariance.py \
   --output validation/results/jax_benchmark.json
 ```
 
-Add `--batched` to benchmark the optional locked 128-wavelength mode.  Compare
-batched and unbatched Jacobians/covariances directly with:
+The benchmark command defaults to the unbatched comparison mode; add
+`--batched` to benchmark the production-default locked 128-wavelength mode.
+Compare batched and unbatched Jacobians/covariances directly with:
 
 ```bash
 python validation/compare_jax_batching.py \

@@ -37,7 +37,7 @@ kernel speedups.
 The earlier finite-difference covariance implementation required about
 8.1--11.7 times the covariance-disabled runtime.  The production JAX path
 reduces the observed total warm ratio to 1.37--1.95 unbatched and 1.39--1.94
-with optional wavelength batching.
+with the default wavelength batching.
 
 ## Locked benchmark configuration
 
@@ -61,9 +61,8 @@ the JAX executable cache is intentionally retained for the warm measurement.
 ## Unbatched results
 
 Unbatched differentiation evaluates all native wavelengths simultaneously.
-It is the default because it preserves the originally validated JAX execution
-shape.  All numerical, provenance, and runtime gates passed.  The 4 GiB RSS
-gate failed.
+It is retained as an explicit comparison and fallback mode.  All numerical,
+provenance, and runtime gates passed.  The 4 GiB RSS gate failed.
 
 | Channel | PSF | Off (s) | Cold JAX (s) | Warm JAX (s) | Cold/off | Warm/off | Peak RSS | Result |
 |---|---|---:|---:|---:|---:|---:|---:|---|
@@ -77,18 +76,20 @@ flux-covariance validation eigensolve.  The covariance-disabled R
 Gaussian/Moffat run peaked at approximately 0.51 GB, while its unbatched JAX
 run reached approximately 10.9 GB.
 
-## Optional 128-wavelength batching
+## Default 128-wavelength batching
 
-The opt-in mode evaluates independent wavelength slices in locked batches of
-128.  It is enabled with:
+The default mode evaluates independent wavelength slices in locked batches of
+128.  A normal JAX covariance extraction uses:
 
 ```text
-extract-star2 -V --jacobian-backend jax --jax-wavelength-batching ...
+extract-star2 -V --jacobian-backend jax ...
 ```
 
-The Python API uses `jax_wavelength_batch=128`.  Other sizes are rejected so
-the production configuration cannot drift silently.  Enabling the mode emits
-a warning explaining its numerical effect.
+The Python API defaults to `jax_wavelength_batch=128`.  Other non-null sizes
+are rejected so the production configuration cannot drift silently.  Use
+`--no-jax-wavelength-batching` or `jax_wavelength_batch=None` for the
+unbatched fallback.  Batched execution emits a warning explaining its
+numerical effect.
 
 | Channel | PSF | Off (s) | Cold JAX (s) | Warm JAX (s) | Cold/off | Warm/off | Peak RSS | Result |
 |---|---|---:|---:|---:|---:|---:|---:|---|
@@ -137,17 +138,34 @@ PSF once unbatched and once with the 128-wavelength option:
 Thus batching happened to be bit-identical for the tested production cubes,
 including the complete propagated covariance.  The synthetic tests prove that
 bit identity is not guaranteed for every wavelength shape, so the user-facing
-roundoff warning and explicit opt-in remain necessary.
+roundoff warning and explicit fallback remain necessary.
 
-Unbatched JAX remains the default.  Batching is an explicit operational choice
-for installations that prefer lower memory use and accept the documented
-roundoff-level covariance difference.
+The locked 128-wavelength mode is the production default.  This decision is
+based on exact results for all four real-cube cases, a 70--81% peak-RSS
+reduction, small measured runtime impact, authoritative NumPy flux
+preservation, and only approximately `1e-15` relative changes in synthetic
+JAX derivative/covariance comparisons.
+
+### Optional future shape investigation
+
+The following matrix is recorded for interested reviewers but is not a release
+gate:
+
+- additional real exposures and wavelength truncations;
+- awkward batch remainders, especially a final batch of one wavelength;
+- background degrees `-1`, `0`, and polynomial backgrounds;
+- alternate subsampling and border configurations; and
+- bright/faint source regimes.
+
+These checks may help identify precisely which XLA shapes produce bitwise
+changes, but the currently measured differences are already far below the
+declared numerical covariance tolerances.
 
 ## Current conclusion and remaining gates
 
 The exact Fourier-domain JAX map is now wired into real covariance extraction.
 Both PSFs preserve accepted flux and meet the locked total-runtime targets.
-The optional 128-wavelength mode also meets the 4 GiB RSS gate.
+The default 128-wavelength mode also meets the 4 GiB RSS gate.
 
 Production readiness is not yet established.  The following remain required:
 
