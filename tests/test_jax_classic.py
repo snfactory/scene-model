@@ -46,12 +46,16 @@ def _classic_fixture(exposure_time=20.0, background_degree=1,
     images = []
     for wavelength, amplitude, background, slope_x, slope_y in zip(
             wavelengths, amplitudes, backgrounds, slopes_x, slopes_y):
+        coefficient_parameters = {"amplitude": amplitude}
+        if background_degree >= 0:
+            coefficient_parameters["background"] = background
+        if background_degree >= 1:
+            coefficient_parameters.update(
+                background_1_0=slope_x, background_0_1=slope_y
+            )
         images.append(model.evaluate(
             wavelength=wavelength,
-            amplitude=amplitude,
-            background=background,
-            background_1_0=slope_x,
-            background_0_1=slope_y,
+            **coefficient_parameters,
             **parameters,
         ))
     images = np.asarray(images)
@@ -114,6 +118,19 @@ def test_classic_fixed_jax_flux_matches_production_numpy(exposure_time):
     assert fixed.inverse_variance[0, 1, 9] == 0.0
     assert fixed.inverse_variance[1, 11, 2] == 0.0
     assert fixed.inverse_variance[2, 4, 12] == 0.0
+
+
+def test_classic_fixed_jax_flux_supports_no_background():
+    pytest.importorskip("jax")
+    model, images, variance, wavelengths, values, fixed = _classic_fixture(
+        background_degree=-1
+    )
+    expected = _numpy_flux(
+        model, images, variance, wavelengths, values, CLASSIC_PARAMETER_NAMES
+    )
+    actual = classic_flux(values, CLASSIC_PARAMETER_NAMES, fixed)
+    np.testing.assert_allclose(actual, expected, rtol=1e-12, atol=0.0)
+    assert fixed.background_bases.shape == (0, 15, 15)
 
 
 def test_classic_named_parameter_reordering_preserves_flux_and_jacobian():

@@ -274,7 +274,7 @@ def _classic_flux_impl(canonical_parameters, data, inverse_variance,
     fixed_background = jnp.broadcast_to(
         background_bases[jnp.newaxis, :, :, :],
         (nwave,) + background_bases.shape,
-    ).reshape(nwave, background_bases.shape[0], -1)
+    ).reshape(nwave, background_bases.shape[0], native_x * native_y)
     design = jnp.concatenate(
         (source_basis[:, jnp.newaxis, :], fixed_background), axis=1
     ).transpose(0, 2, 1)
