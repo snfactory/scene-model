@@ -11,13 +11,10 @@ PSF and a model of the tracking.
 import os
 import numpy as np
 
-from ToolBox.Misc import warning2stdout
-
 import scene_model
 from scene_model import snifs as snifs_scene
 
 import warnings
-warnings.showwarning = warning2stdout   # Redirect warnings to stdout
 warnings.filterwarnings("ignore", "Overwriting existing file")
 
 # Numpy setup
@@ -110,6 +107,12 @@ if __name__ == "__main__":
                       help="Accountant output YAML file")
 
     opts, args = parser.parse_args()
+
+    # Import the legacy SNfactory compatibility layer only after option
+    # parsing, so metadata operations such as ``extract-star2 --help`` do not
+    # require the runtime adapter to be installed.
+    from ToolBox.Misc import warning2stdout
+    warnings.showwarning = warning2stdout
     if not opts.input:
         if args:
             opts.input = args[0]
@@ -168,7 +171,7 @@ if __name__ == "__main__":
             verbosity=opts.verbosity
         )
     except scene_model.SceneModelException as e:
-        parser.error(e.message)
+        parser.error(str(e))
 
     # If the output paths weren't specified, build defaults.
     if not opts.out:

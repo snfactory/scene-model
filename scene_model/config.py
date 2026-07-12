@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import print_function
 
-__version__ = "0.1"
+__version__ = "0.1.0"
 __author__ = "K. Boone, Y. Copin, C. Buton, E. Pecontal"
 
 ###############################################################################

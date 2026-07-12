@@ -326,17 +326,9 @@ def write_pysnifs_spectrum(spectrum, path=None, header=None):
         hduList.append(hducov)
 
     if path:                        # Save hduList to disk
-        # writeto uses the clobber keyword for astropy < 1.3, and the overwrite
-        # keyword for astropy >= 1.3. Unfortunately the CC is on astropy 1.0,
-        # so we need to pick the right one.
-        import astropy
-        from distutils.version import LooseVersion
-        astropy_version = LooseVersion(astropy.__version__)
-        change_version = LooseVersion('1.3')
-        if astropy_version >= change_version:
-            hduList.writeto(path, output_verify='silentfix', overwrite=True)
-        else:
-            hduList.writeto(path, output_verify='silentfix', clobber=True)
+        # ``distutils`` was removed in Python 3.12.  All supported Astropy
+        # releases use ``overwrite`` rather than the historical ``clobber``.
+        hduList.writeto(path, output_verify='silentfix', overwrite=True)
 
     return hduList                  # For further handling if needed
 
@@ -2271,7 +2263,8 @@ class SnifsCubeFitter(object):
 
             ax.set_ylim(data.min() / 1.2, data.max() * 1.2)
             ax.set_xlim(-1, 226)
-            if ax.is_last_row() and ax.is_first_col():
+            if (ax.get_subplotspec().is_last_row() and
+                    ax.get_subplotspec().is_first_col()):
                 ax.set_xlabel("Spaxel #", fontsize='small')
                 ax.set_ylabel("Flux", fontsize='small')
 
@@ -2341,7 +2334,8 @@ class SnifsCubeFitter(object):
                      fontsize='xx-small')
             ax.text(0.05, 0.85, u"%.0f Å" % self.meta_cube.lbda[i],
                     fontsize='x-small', transform=ax.transAxes)
-            if ax.is_last_row() and ax.is_first_col():
+            if (ax.get_subplotspec().is_last_row() and
+                    ax.get_subplotspec().is_first_col()):
                 ax.set_xlabel("I (blue) or J (red)", fontsize='small')
                 ax.set_ylabel("Flux", fontsize='small')
 
@@ -2744,12 +2738,13 @@ class SnifsCubeFitter(object):
             ax.axis(extent)
 
             # Axis management
-            if ax.is_last_row() and ax.is_first_col():
+            if (ax.get_subplotspec().is_last_row() and
+                    ax.get_subplotspec().is_first_col()):
                 ax.set_xlabel("I [spx]", fontsize='small')
                 ax.set_ylabel("J [spx]", fontsize='small')
-            if not ax.is_last_row():
+            if not ax.get_subplotspec().is_last_row():
                 ax.xaxis.set_major_formatter(matplotlib.ticker.NullFormatter())
-            if not ax.is_first_col():
+            if not ax.get_subplotspec().is_first_col():
                 ax.yaxis.set_major_formatter(matplotlib.ticker.NullFormatter())
 
         # Common image normalization
@@ -2875,7 +2870,8 @@ class SnifsCubeFitter(object):
                      fontsize='xx-small')
             ax.text(0.05, 0.85, u"%.0f Å" % wavelengths[i],
                     fontsize='x-small', transform=ax.transAxes)
-            if ax.is_last_row() and ax.is_first_col():
+            if (ax.get_subplotspec().is_last_row() and
+                    ax.get_subplotspec().is_first_col()):
                 ax.set_xlabel("Elliptical radius [spx]", fontsize='small')
                 ax.set_ylabel("Flux", fontsize='small')
             ax.axis([0, rfit.max() * 1.1,
@@ -2969,12 +2965,13 @@ class SnifsCubeFitter(object):
             ax.text(0.05, 0.85, u"%.0f Å" % wavelengths[i], fontsize='x-small',
                     transform=ax.transAxes)
             ax.axis(extent)
-            if ax.is_last_row() and ax.is_first_col():
+            if (ax.get_subplotspec().is_last_row() and
+                    ax.get_subplotspec().is_first_col()):
                 ax.set_xlabel("I [spx]", fontsize='small')
                 ax.set_ylabel("J [spx]", fontsize='small')
-            if not ax.is_last_row():
+            if not ax.get_subplotspec().is_last_row():
                 plt.setp(ax.get_xticklabels(), visible=False)
-            if not ax.is_first_col():
+            if not ax.get_subplotspec().is_first_col():
                 plt.setp(ax.get_yticklabels(), visible=False)
 
         fig.subplots_adjust(left=0.05, right=0.96, bottom=0.06, top=0.95,

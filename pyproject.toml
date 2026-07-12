@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "scene-model"
+dynamic = ["version"]
+description = "Scene modeling and point-source extraction for SNIFS IFU data"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [
+    { name = "Kyle Boone", email = "kboone@berkeley.edu" },
+]
+dependencies = [
+    "astropy",
+    "matplotlib",
+    "numpy",
+    "scipy",
+]
+
+[project.scripts]
+extract-star2 = "scene_model.cli:main"
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[tool.setuptools]
+packages = ["scene_model", "scripts"]
+
+[tool.setuptools.dynamic]
+version = { attr = "scene_model.config.__version__" }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
