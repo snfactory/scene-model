@@ -193,3 +193,31 @@ all of the behavior, but it also need not continue distributing the complete
 legacy namespaces as accidental public APIs.  Minimizing them into
 `scene_model._compat`, preserving the third-party license and artifact-visible
 provenance, is the appropriate forward-only correction.
+
+## Implemented cleanup result
+
+The `minimize-vendored-runtime` branch implements that correction without
+changing the PSF, covariance, or JAX algorithms:
+
+- the 2,730-line top-level compatibility packages are removed;
+- 836 lines of reachable support code remain under the private
+  `scene_model._compat` namespace;
+- all three installed scripts import that private namespace, while the
+  general `ToolBox.Optimizer` wrapper is replaced at its sole call site by a
+  direct SciPy residual function;
+- the wheel and source archive contain neither top-level `ToolBox` nor
+  top-level `pySNIFS`, and both contain `_compat/NOTICE.md` plus the public
+  extract-star MIT license;
+- clean artifacts measured 107,248 bytes for the wheel and 114,674 bytes for
+  the source archive in the validation build;
+- the full repository suite passes, including successful private-runtime
+  workflows for `extract_star2`, `extract_fixed_star2`, and `subtract_psf2`,
+  plus both dynamic cube writers;
+- an external real-data comparison on the locked B and R cubes passed at
+  exact tolerance for classic and Fourier PSFs: fitted parameters, extracted
+  flux, variance, covariance, and selected headers all had zero difference.
+
+The reproducible gates are
+`validation/inventory_runtime_artifact.py --mode minimized` and
+`validation/compare_runtime_baseline.py`. The real observation cubes remain
+external; the latter report records only their SHA-256 identities.

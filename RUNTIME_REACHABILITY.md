@@ -115,3 +115,13 @@ normal and covariance extraction, diagnostic plotting, `--keepmodel`, all
 three scripts, and spectrum/cube writes. Built wheel and sdist inspection must
 then pass `validation/inventory_runtime_artifact.py --mode minimized`.
 
+### Gate result on `minimize-vendored-runtime`
+
+The gate is satisfied. The full suite covers the retained numerical and I/O
+contracts, successful mocked orchestration for all three scripts, both E3D and
+FITS3D dynamic writers, sparse FITS3D lenslets, missing variance, plotting,
+and package imports. Built wheel and source archives pass minimized inventory
+with the private notice and extract-star license present. Finally, locked real
+B/R cubes were compared against `robust-flux-cov@88f6c31` for classic and
+Fourier PSFs at `rtol=0`, `atol=0`; fitted parameters, flux, variance,
+covariance, and selected headers were exactly equal in all four cases.
