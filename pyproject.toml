@@ -33,11 +33,12 @@ test = ["pytest>=8"]
 [tool.setuptools]
 packages = [
     "scene_model",
+    "scene_model._compat",
     "scripts",
-    "ToolBox",
-    "ToolBox.Astro",
-    "pySNIFS",
 ]
+
+[tool.setuptools.package-data]
+"scene_model._compat" = ["NOTICE.md"]
 
 [tool.setuptools.dynamic]
 version = { attr = "scene_model.config.__version__" }

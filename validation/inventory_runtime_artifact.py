@@ -87,8 +87,14 @@ def inspect_archive(path: Path, mode: str) -> dict[str, object]:
             )
         if not private_compat:
             errors.append("scene_model/_compat payload is absent")
-        if not notices:
-            errors.append("no license, notice, or provenance payload found")
+        if "scene_model/_compat/NOTICE.md" not in members:
+            errors.append("scene_model/_compat/NOTICE.md is absent")
+        extract_star_licenses = [
+            member for member in members
+            if PurePosixPath(member).name == "extract-star-MIT.txt"
+        ]
+        if not extract_star_licenses:
+            errors.append("extract-star MIT license payload is absent")
 
     return {
         "artifact": str(path),
