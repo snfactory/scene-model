@@ -22,6 +22,18 @@ def test_runtime_version_matches_distribution_metadata():
     assert config.__version__ == "0.1.0"
 
 
+def test_jax_runtime_and_cuda_profile_are_exactly_pinned():
+    metadata = tomllib.loads(
+        (Path(__file__).parents[1] / "pyproject.toml").read_text()
+    )
+
+    assert metadata["project"]["dependencies"].count("jax==0.10.2") == 1
+    assert metadata["project"]["optional-dependencies"]["cuda13"] == [
+        "jax[cuda13]==0.10.2; sys_platform == 'linux' and "
+        "platform_machine == 'x86_64'"
+    ]
+
+
 def test_main_accepts_explicit_argv_and_restores_process_argv(capsys):
     original = sys.argv
 

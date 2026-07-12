@@ -65,13 +65,14 @@ check.
 
 ## Recommendation
 
-**GO for one bounded exact-classic JAX port; NO-GO for adding JAX as a runtime
-dependency yet.** Forward-mode JAX is technically compatible with both
-required numerical paths and has enough representative speed and memory
-margin to address the Cov-M1 runtime failure. The next experiment should
-export fixed arrays/masks from `SnifsCubeFitter`, port the exact classic basis,
-and benchmark B classic end-to-end. Proceed to Fourier only after exact classic
-flux and Jacobian parity pass.
+**GO for promoting forward-mode JAX 0.10.2 through one bounded exact-classic
+port first.** Scene-model now pins that version as a production dependency,
+with a separate CUDA 13 installation profile. The representative experiment
+shows enough speed and memory margin to address the Cov-M1 runtime failure,
+but it does not establish production flux or Jacobian parity. The production
+work must export fixed arrays and masks from `SnifsCubeFitter`, port the exact
+classic basis, and benchmark B classic end-to-end. Proceed to Fourier only
+after exact classic flux and Jacobian parity pass.
 
 Numba is a weaker next choice: it is unavailable here, does not supply the
 needed automatic differentiation, and its support for this FFT-heavy array

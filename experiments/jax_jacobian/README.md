@@ -22,8 +22,10 @@ python -m experiments.jax_jacobian.benchmark --profile both --nwave 779
 pytest -q experiments/jax_jacobian/test_prototype.py
 ```
 
-JAX is intentionally not a package dependency. This directory is never
-imported by production code.
+Scene-model now pins JAX 0.10.2 as a production dependency, with a separate
+CUDA 13 installation profile for supported Linux x86_64 deployments. This
+experiment remains isolated from production code: it exercises representative
+operation classes and is not an implementation of either production PSF.
 
 ## Integration obstacles
 
