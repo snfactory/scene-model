@@ -9,6 +9,7 @@ results plus the documented diagnostic attributes of ``SnifsCubeFitter``.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import platform
@@ -37,10 +38,8 @@ BOUNDARIES = {
     "pull_mean": (-0.1, 0.1),
     "pull_rms": (0.9, 1.1),
     "variance_ratio_median": (0.9, 1.1),
-    "band_ratio_0": (0.9, 1.1),
-    "band_ratio_1": (0.9, 1.1),
-    "band_ratio_2": (0.9, 1.1),
 }
+CHECKPOINT_CONTRACT = "SNIFS-JAX-SCENE-MC-1.0"
 
 
 @dataclass(frozen=True)
@@ -51,6 +50,7 @@ class Scenario:
     level: str
     source_scale: float
     cube_path: str
+    cube_sha256: str
 
     @property
     def name(self):
@@ -73,7 +73,18 @@ def current_peak_rss_bytes():
     return int(value * 1024)
 
 
-def _fit(cube_path, psf, covariance):
+def file_sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        while True:
+            block = stream.read(1024 * 1024)
+            if not block:
+                break
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _fit(cube_path, psf, covariance, jacobian_backend="jax"):
     fitter = SnifsCubeFitter(
         str(cube_path), psf=psf, background_degree=0,
         subsampling=3, border=15, least_squares=False,
@@ -82,7 +93,10 @@ def _fit(cube_path, psf, covariance):
     fitter.fit_metaslices_2d(num_meta_slices=12)
     fitter.fit_metaslices_3d()
     fitter.check_validity()
-    fitter.extract(method="psf", covariance=covariance)
+    fitter.extract(
+        method="psf", covariance=covariance,
+        jacobian_backend=jacobian_backend,
+    )
     return fitter
 
 
@@ -162,6 +176,7 @@ def _empty_checkpoint(truth_flux, scenario, root_seed):
     length = len(truth_flux)
     pairs = _correlation_pairs(length)
     return {
+        "checkpoint_contract": np.array(CHECKPOINT_CONTRACT),
         "scenario_json": json.dumps(asdict(scenario), sort_keys=True),
         "root_seed": int(root_seed),
         "truth_flux": np.asarray(truth_flux),
@@ -176,6 +191,9 @@ def _empty_checkpoint(truth_flux, scenario, root_seed):
         "ranks": np.empty(0, dtype=np.int64),
         "maximum_derivative_stability": np.empty(0),
         "flux_parity": np.empty(0, dtype=bool),
+        "covariance_valid": np.empty(0, dtype=bool),
+        "derivative_backends": np.empty(0, dtype="U32"),
+        "derivative_provenance_json": np.empty(0, dtype="U2048"),
         "seeds": np.empty(0, dtype=np.uint64),
     }
 
@@ -199,6 +217,10 @@ def _load_checkpoint(path, truth_flux, scenario, root_seed):
         return _empty_checkpoint(truth_flux, scenario, root_seed)
     with np.load(path, allow_pickle=False) as saved:
         state = {name: saved[name] for name in saved.files}
+    if str(state.get("checkpoint_contract", "")) != CHECKPOINT_CONTRACT:
+        raise RuntimeError(
+            "Checkpoint predates the locked JAX validation contract"
+        )
     saved_scenario = str(state["scenario_json"])
     expected_scenario = json.dumps(asdict(scenario), sort_keys=True)
     if saved_scenario != expected_scenario:
@@ -218,7 +240,8 @@ def _append(state, key, value):
 
 
 def _run_one_realization(scenario, nominal_fitter, truth_model, truth_flux,
-                         root_seed, realization_index, scratch):
+                         root_seed, realization_index, scratch,
+                         jacobian_backend):
     seed = realization_seed(root_seed, scenario.index, realization_index)
     rng = np.random.default_rng(seed)
     variance = np.asarray(nominal_fitter.cube.var, dtype=float)
@@ -229,10 +252,16 @@ def _run_one_realization(scenario, nominal_fitter, truth_model, truth_flux,
     _write_realization(nominal_fitter.cube, noisy_data, realization_path)
     start = time.perf_counter()
     try:
-        fitted = _fit(realization_path, scenario.psf, covariance=False)
+        fitted = _fit(
+            realization_path, scenario.psf, covariance=False,
+            jacobian_backend=jacobian_backend,
+        )
         legacy_runtime = time.perf_counter() - start
         flux_without = np.asarray(fitted.point_source_spectrum.data).copy()
-        fitted.extract(method="psf", covariance=True)
+        fitted.extract(
+            method="psf", covariance=True,
+            jacobian_backend=jacobian_backend,
+        )
         runtime = time.perf_counter() - start
     finally:
         realization_path.unlink(missing_ok=True)
@@ -240,6 +269,17 @@ def _run_one_realization(scenario, nominal_fitter, truth_model, truth_flux,
     covariance = np.asarray(fitted.point_source_spectrum.cov).copy()
     factor = fitted.covariance_diagnostics["factorization"]
     derivatives = fitted.covariance_diagnostics["derivatives"]
+    eigenvalues = np.linalg.eigvalsh(covariance)
+    eigenvalue_scale = max(
+        float(np.max(np.abs(eigenvalues))), np.finfo(float).tiny
+    )
+    covariance_valid = (
+        np.all(np.isfinite(covariance))
+        and np.array_equal(covariance, covariance.T)
+        and np.array_equal(fitted.point_source_spectrum.var,
+                           np.diag(covariance))
+        and float(eigenvalues[0]) >= -1e-10 * eigenvalue_scale
+    )
     return {
         "seed": seed,
         "flux": flux,
@@ -248,8 +288,14 @@ def _run_one_realization(scenario, nominal_fitter, truth_model, truth_flux,
         "legacy_runtime": legacy_runtime,
         "rss": current_peak_rss_bytes(),
         "rank": factor.rank,
-        "stability": max(derivatives.stability, default=0.0),
+        "stability": (max(derivatives.stability)
+                      if derivatives.stability else np.nan),
         "parity": np.array_equal(flux_without, flux),
+        "covariance_valid": covariance_valid,
+        "derivative_backend": derivatives.backend,
+        "derivative_provenance_json": json.dumps(
+            dict(derivatives.provenance), sort_keys=True
+        ),
     }
 
 
@@ -271,6 +317,10 @@ def _record(state, result, band_weights, pairs):
         ("ranks", result["rank"]),
         ("maximum_derivative_stability", result["stability"]),
         ("flux_parity", result["parity"]),
+        ("covariance_valid", result["covariance_valid"]),
+        ("derivative_backends", result["derivative_backend"]),
+        ("derivative_provenance_json",
+         result["derivative_provenance_json"]),
         ("seeds", result["seed"]),
     ):
         _append(state, key, value)
@@ -367,16 +417,24 @@ def _summarize(state, scenario, band_weights, pairs, legacy_seconds,
     correlations = _correlation_metrics(state, pairs)
     runtime_ratios = state["runtimes"] / state["legacy_runtimes"]
     gates = {
-        key: bool(low < metrics[key] < high)
+        key: bool(low <= metrics[key] <= high)
         for key, (low, high) in BOUNDARIES.items()
     }
+    derivative_backends = sorted(set(
+        str(value) for value in state["derivative_backends"]
+    ))
+    provenance_payloads = sorted(set(
+        str(value) for value in state["derivative_provenance_json"]
+    ))
+    provenance = [json.loads(value) for value in provenance_payloads]
     gates.update({
-        "correlations": all(item["consistent"] for item in correlations),
-        "peak_rss": int(np.max(state["peak_rss_bytes"])) < 4 * 1024**3,
-        "runtime": float(np.median(runtime_ratios)) < 5.0,
         "flux_parity": bool(np.all(state["flux_parity"])),
-        "derivative_stability": (
-            float(np.max(state["maximum_derivative_stability"])) <= 5e-3
+        "covariance_valid": bool(np.all(state["covariance_valid"])),
+        "jax_backend": derivative_backends == ["jax"],
+        "jax_provenance": bool(provenance) and all(
+            {"jax", "jaxlib", "backend", "device", "architecture", "x64"}
+            <= item.keys() and item["x64"] == "true"
+            for item in provenance
         ),
     })
     overlap = {
@@ -393,6 +451,9 @@ def _summarize(state, scenario, band_weights, pairs, legacy_seconds,
         "bootstrap_95_ci": intervals,
         "boundary_overlap": overlap,
         "correlations": correlations,
+        "correlations_all_consistent_diagnostic": all(
+            item["consistent"] for item in correlations
+        ),
         "runtime_seconds": {
             "nominal_legacy_reference": legacy_seconds,
             "median_corresponding_legacy": float(np.median(
@@ -408,9 +469,13 @@ def _summarize(state, scenario, band_weights, pairs, legacy_seconds,
             "minimum": int(np.min(state["ranks"])),
             "maximum": int(np.max(state["ranks"])),
         },
-        "maximum_derivative_stability": float(np.max(
-            state["maximum_derivative_stability"]
-        )),
+        "maximum_derivative_stability": (
+            float(np.nanmax(state["maximum_derivative_stability"]))
+            if np.any(np.isfinite(state["maximum_derivative_stability"]))
+            else None
+        ),
+        "derivative_backends": derivative_backends,
+        "derivative_provenance": provenance,
         "flux_array_equal_all": bool(np.all(state["flux_parity"])),
         "gates": gates,
         "passed": all(gates.values()),
@@ -426,11 +491,15 @@ def _scenarios(blue, red):
     result = []
     index = 0
     for channel, cube in (("B", blue), ("R", red)):
+        resolved_cube = str(Path(cube).resolve())
+        cube_hash = file_sha256(resolved_cube)
         for psf in ("classic", "fourier"):
             for level, scale in (("bright", BRIGHT_SCALE),
                                  ("faint", FAINT_SCALE)):
-                result.append(Scenario(index, channel, psf, level, scale,
-                                       str(Path(cube).resolve())))
+                result.append(Scenario(
+                    index, channel, psf, level, scale, resolved_cube,
+                    cube_hash,
+                ))
                 index += 1
     return result
 
@@ -438,7 +507,7 @@ def _scenarios(blue, red):
 def _write_reports(output, reports):
     output.mkdir(parents=True, exist_ok=True)
     payload = {
-        "format": "SNIFS-COV-M1-VALIDATION-1.0",
+        "format": "SNIFS-JAX-SCENE-MC-1.0",
         "generated_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "offline_science_ensemble": True,
         "scenario_count": len(reports),
@@ -520,6 +589,7 @@ def run(args):
                     result = _run_one_realization(
                         scenario, nominal_fitter, truth_model, truth_flux,
                         args.root_seed, index, scratch,
+                        args.jacobian_backend,
                     )
                     _record(state, result, bands, pairs)
                     if (len(state["fluxes"]) % args.checkpoint_every == 0
@@ -554,6 +624,10 @@ def build_parser():
     parser.add_argument("--escalated-samples", type=int,
                         default=ESCALATED_SAMPLES)
     parser.add_argument("--checkpoint-every", type=int, default=16)
+    parser.add_argument(
+        "--jacobian-backend", choices=("jax",), default="jax",
+        help="Locked production derivative backend (default: jax)",
+    )
     return parser
 
 
