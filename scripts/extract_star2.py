@@ -77,10 +77,13 @@ if __name__ == "__main__":
                       default='finite-difference',
                       help="Flux-covariance Jacobian backend "
                       "(finite-difference|jax) [%default]")
-    parser.add_option("--jax-wavelength-batching", action="store_true",
-                      default=False,
-                      help="Opt into locked 128-wavelength JAX batches; "
-                      "reduces memory but may change covariance at roundoff")
+    parser.add_option("--jax-wavelength-batching",
+                      dest="jax_wavelength_batching", action="store_true",
+                      default=True,
+                      help="Use locked 128-wavelength JAX batches [%default]")
+    parser.add_option("--no-jax-wavelength-batching",
+                      dest="jax_wavelength_batching", action="store_false",
+                      help="Disable JAX wavelength batching")
     parser.add_option("--filterVariance", dest="filter_variance",
                       action="store_true", help="Apply a filter in wavelength "
                       "to the variance estimate to avoid Poisson biases.",
@@ -145,13 +148,6 @@ if __name__ == "__main__":
 
     if opts.seeingPrior and not opts.usePriors:
         parser.error("Seeing prior requires prior usage (--usePriors > 0).")
-    if opts.jax_wavelength_batching and (
-            not opts.covariance or opts.jacobian_backend != 'jax'):
-        parser.error(
-            "--jax-wavelength-batching requires --covariance and "
-            "--jacobian-backend jax"
-        )
-
     # Import the legacy SNfactory compatibility layer only after parsing and
     # validation, so metadata and usage errors do not require the runtime
     # adapter to be installed.
@@ -227,7 +223,8 @@ if __name__ == "__main__":
         fitter.meta_cube_model.WR_3d_fits(model_path, header=[])
 
     # Extract the point source spectrum
-    if opts.jax_wavelength_batching:
+    if (opts.covariance and opts.jacobian_backend == 'jax' and
+            opts.jax_wavelength_batching):
         from scene_model.jax_scene import PRODUCTION_WAVELENGTH_BATCH
         jax_wavelength_batch = PRODUCTION_WAVELENGTH_BATCH
     else:

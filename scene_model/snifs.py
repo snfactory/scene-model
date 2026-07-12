@@ -2031,7 +2031,7 @@ class SnifsCubeFitter(object):
 
     def extract(self, method='psf', radius=None, covariance=False,
                 jacobian_backend='finite-difference',
-                jax_wavelength_batch=None, **kwargs):
+                jax_wavelength_batch=128, **kwargs):
         """Extract the PSF. See SceneModel.extract for details.
 
         If aperture photometry is being performed, radius is interpreted
@@ -2227,7 +2227,8 @@ class SnifsCubeFitter(object):
                     print(
                         "WARNING: JAX wavelength batching (%d) may change "
                         "the JAX surrogate and covariance at floating-point "
-                        "roundoff; accepted NumPy flux remains authoritative."
+                        "roundoff; accepted NumPy flux remains authoritative. "
+                        "Set jax_wavelength_batch=None to disable batching."
                         % jax_wavelength_batch
                     )
 
