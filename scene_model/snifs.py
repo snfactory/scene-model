@@ -2,6 +2,7 @@
 from __future__ import print_function
 
 import os
+import tempfile
 from copy import deepcopy
 from astropy.io import fits
 from astropy.table import Table
@@ -21,6 +22,8 @@ from .models import GaussianMoffatPsfElement, \
     GaussianSceneModel
 from .fit import MultipleImageFitter
 from .prior import MultivariateGaussianPrior
+from .covariance import assemble_flux_covariance, factor_covariance, \
+    finite_difference_jacobian, select_marginal_covariance
 
 # If we are using autograd, then we need to use a special version of numpy.
 from .config import numpy as np
@@ -286,7 +289,8 @@ def fit_power_law(x, y, deg=2, guess=None):
         raise SceneModelException("fit_power_law did not converge")
 
 
-def write_pysnifs_spectrum(spectrum, path=None, header=None):
+def write_pysnifs_spectrum(spectrum, path=None, header=None,
+                           transactional=False):
     """Write a pySNIFS spectrum to a fits file at the given path.
 
     This was adapted from extract_star.py
@@ -328,7 +332,22 @@ def write_pysnifs_spectrum(spectrum, path=None, header=None):
     if path:                        # Save hduList to disk
         # ``distutils`` was removed in Python 3.12.  All supported Astropy
         # releases use ``overwrite`` rather than the historical ``clobber``.
-        hduList.writeto(path, output_verify='silentfix', overwrite=True)
+        if transactional:
+            output_directory = os.path.dirname(os.path.abspath(path))
+            descriptor, temporary_path = tempfile.mkstemp(
+                prefix='.%s.' % os.path.basename(path), suffix='.tmp',
+                dir=output_directory,
+            )
+            os.close(descriptor)
+            try:
+                hduList.writeto(temporary_path, output_verify='silentfix',
+                                overwrite=True)
+                os.replace(temporary_path, path)
+            finally:
+                if os.path.exists(temporary_path):
+                    os.unlink(temporary_path)
+        else:
+            hduList.writeto(path, output_verify='silentfix', overwrite=True)
 
     return hduList                  # For further handling if needed
 
@@ -1286,6 +1305,10 @@ class SnifsCubeFitter(object):
         self.fit_scene_model = None
         self.meta_cube_model = None
         self.reference_seeing = None
+        self.fit_covariance_names = None
+        self.fit_covariance = None
+        self.fit_global_parameter_info = None
+        self.fit_global_covariance = None
 
         # Extraction
         self.extraction = None
@@ -1293,6 +1316,8 @@ class SnifsCubeFitter(object):
         self.extraction_radius = None
         self.point_source_spectrum = None
         self.background_spectrum = None
+        self.sky_spectrum = None
+        self.covariance_diagnostics = None
 
         self.print_cube_info()
 
@@ -1786,6 +1811,13 @@ class SnifsCubeFitter(object):
             fitter.print_fit_info("3D metaslice fit", uncertainties=False)
             raise
 
+        global_parameter_info = fitter.global_fit_parameter_info
+        global_names = tuple(parameter.name for parameter in
+                             global_parameter_info)
+        global_covariance = select_marginal_covariance(
+            covariance_names, covariance, global_names
+        )
+
         uncertainties = fitter.calculate_uncertainties(
             names=covariance_names, covariance=covariance
         )
@@ -1855,6 +1887,10 @@ class SnifsCubeFitter(object):
         self.fitter_3d = fitter
         self.fit_parameters = fitter.parameters
         self.fit_uncertainties = uncertainties
+        self.fit_covariance_names = tuple(covariance_names)
+        self.fit_covariance = np.array(covariance, copy=True)
+        self.fit_global_parameter_info = global_parameter_info
+        self.fit_global_covariance = global_covariance
         self.fit_scene_model = fit_scene_model
         self.meta_cube_model = meta_cube_model
         self.reference_seeing = reference_seeing
@@ -1992,17 +2028,39 @@ class SnifsCubeFitter(object):
                 (fit_seeing_widths.min(),
                  self.meta_cube.lbda[fit_seeing_widths.argmin()]))
 
-    def extract(self, method='psf', radius=None, **kwargs):
+    def extract(self, method='psf', radius=None, covariance=False, **kwargs):
         """Extract the PSF. See SceneModel.extract for details.
 
         If aperture photometry is being performed, radius is interpreted
         as a multiple of the seeing sigmas if it is less than 0, and a radius
         in arcseconds if it is greater than 0.
         """
+        # Never allow a failed covariance request to expose an earlier result
+        # as though it belonged to the current request.
+        self.covariance_diagnostics = None
+        if covariance:
+            self.extraction = None
+            self.point_source_spectrum = None
+            self.background_spectrum = None
+            self.sky_spectrum = None
+
         # Make sure that the 3D fit has already been done.
         if self.fit_scene_model is None:
             raise SceneModelException(
                 "Must run the 3D metaslice fit before extracting!"
+            )
+        if covariance and method != 'psf':
+            raise SceneModelException(
+                "Covariance propagation is only available for PSF extraction"
+            )
+        if covariance and self.least_squares:
+            raise SceneModelException(
+                "Covariance propagation requires statistical cube variances"
+            )
+        if covariance and (self.fit_global_covariance is None or
+                           self.fit_global_parameter_info is None):
+            raise SceneModelException(
+                "Complete meta-fit covariance is unavailable"
             )
 
         if method == "psf":
@@ -2030,10 +2088,15 @@ class SnifsCubeFitter(object):
         else:
             pixel_radius = None
 
-        extraction = self.fit_scene_model.extract(
+        extraction_result = self.fit_scene_model.extract(
             cube_data, cube_var, method=method, radius=pixel_radius,
-            wavelength=self.cube.lbda
+            wavelength=self.cube.lbda,
+            return_covariance=covariance,
         )
+        if covariance:
+            extraction = extraction_result.table
+        else:
+            extraction = extraction_result
 
         # Build a pySNIFS object for the point source
         point_source_spectrum = pySNIFS.spectrum(
@@ -2042,6 +2105,99 @@ class SnifsCubeFitter(object):
             start=self.cube.lbda[0],
             step=self.cube.lstep,
         )
+
+        if covariance:
+            coefficient_names = extraction_result.coefficient_names
+            coefficient_covariance = extraction_result.coefficient_covariance
+            expected_covariance_shape = (
+                len(extraction), len(coefficient_names), len(coefficient_names)
+            )
+            if coefficient_covariance.shape != expected_covariance_shape:
+                raise SceneModelException(
+                    "Native coefficient covariance axes are inconsistent"
+                )
+            try:
+                amplitude_index = coefficient_names.index('amplitude')
+            except ValueError:
+                raise SceneModelException(
+                    "Point-source amplitude is absent from extraction"
+                )
+            conditional_variance = coefficient_covariance[
+                :, amplitude_index, amplitude_index
+            ]
+            if self.fit_global_covariance.shape != (
+                    len(self.fit_global_parameter_info),
+                    len(self.fit_global_parameter_info)):
+                raise SceneModelException(
+                    "Global parameter covariance axes are inconsistent"
+                )
+            covariance_factor, factor_diagnostics = factor_covariance(
+                self.fit_global_covariance
+            )
+
+            evaluation_model = deepcopy(self.fit_scene_model)
+            fixed_data = np.array(cube_data, copy=True)
+            fixed_variance = np.array(cube_var, copy=True)
+            fixed_wavelength = np.array(self.cube.lbda, copy=True)
+            fixed_data.setflags(write=False)
+            fixed_variance.setflags(write=False)
+            fixed_wavelength.setflags(write=False)
+            expected_flux = np.asarray(extraction['amplitude'])
+            if len(fixed_wavelength) != len(expected_flux):
+                raise SceneModelException(
+                    "Native flux and wavelength axes are inconsistent"
+                )
+
+            def evaluate_flux(parameter_values):
+                parameter_values = np.asarray(parameter_values)
+                parameter_kwargs = {
+                    parameter.name: parameter_values[index]
+                    for index, parameter in enumerate(
+                        self.fit_global_parameter_info)
+                }
+                result = evaluation_model.extract(
+                    fixed_data, fixed_variance, method='psf',
+                    wavelength=fixed_wavelength, return_covariance=True,
+                    **parameter_kwargs
+                )
+                if result.coefficient_names != coefficient_names:
+                    raise SceneModelException(
+                        "Coefficient ordering changed during differentiation"
+                    )
+                flux = np.asarray(result.table['amplitude'])
+                if flux.shape != expected_flux.shape:
+                    raise SceneModelException(
+                        "Flux wavelength axis changed during differentiation"
+                    )
+                return flux
+
+            baseline_values = np.array([
+                parameter.value for parameter in self.fit_global_parameter_info
+            ])
+            if not np.array_equal(evaluate_flux(baseline_values), expected_flux):
+                raise SceneModelException(
+                    "Covariance evaluation changed accepted native flux"
+                )
+
+            jacobian, derivative_diagnostics = finite_difference_jacobian(
+                evaluate_flux, self.fit_global_parameter_info,
+                self.fit_global_covariance,
+            )
+            flux_covariance, propagated_factor = assemble_flux_covariance(
+                conditional_variance, jacobian, covariance_factor
+            )
+            if not np.array_equal(point_source_spectrum.data, expected_flux):
+                raise SceneModelException(
+                    "Covariance assembly changed extracted flux"
+                )
+            point_source_spectrum.cov = flux_covariance
+            point_source_spectrum.var = np.diag(flux_covariance).copy()
+            self.covariance_diagnostics = {
+                'factorization': factor_diagnostics,
+                'derivatives': derivative_diagnostics,
+                'jacobian': jacobian,
+                'propagated_factor': propagated_factor,
+            }
         self.point_source_spectrum = point_source_spectrum
 
         if self.has_sky:
@@ -2128,14 +2284,114 @@ class SnifsCubeFitter(object):
                 header['ES_PRISE'] = (self.seeing_prior,
                                       'Seeing prior [arcsec]')
 
-        # Save the point source spectrum
-        print("  Saving output point-source spectrum to '%s'" % output_path)
-        write_pysnifs_spectrum(self.point_source_spectrum, output_path, header)
+        sky_header = header.copy()
+        covariance_enabled = self.covariance_diagnostics is not None
+        if covariance_enabled:
+            output_covariance = np.asarray(self.point_source_spectrum.cov)
+            output_variance = np.asarray(self.point_source_spectrum.var)
+            output_length = len(self.point_source_spectrum.data)
+            if output_covariance.shape != (output_length, output_length):
+                raise SceneModelException(
+                    "Output covariance and flux axes are inconsistent"
+                )
+            if (not np.all(np.isfinite(output_covariance)) or
+                    not np.array_equal(output_covariance,
+                                       output_covariance.T)):
+                raise SceneModelException(
+                    "Output covariance is non-finite or asymmetric"
+                )
+            if not np.array_equal(output_variance,
+                                  np.diag(output_covariance)):
+                raise SceneModelException(
+                    "Output variance is not the covariance diagonal"
+                )
+            eigenvalues = np.linalg.eigvalsh(output_covariance)
+            eigen_scale = max(float(eigenvalues[-1]), 1.0)
+            if eigenvalues[0] < -1e-10 * eigen_scale:
+                raise SceneModelException("Output covariance is not PSD")
+            factor_info = self.covariance_diagnostics['factorization']
+            derivative_info = self.covariance_diagnostics['derivatives']
+            header['COVVERS'] = ('SNIFS-COV-1.0', 'Flux covariance format')
+            header['COVMETH'] = ('2STAGE-LAPLACE', 'Covariance method')
+            header['COVSCOPE'] = ('SCENE+NATIVE-DIAG', 'Included uncertainty')
+            header['COVINPUT'] = ('E3D-STAT-DIAG', 'Input cube covariance')
+            header['COVDER'] = ('FINITE-DIFFERENCE', 'Flux derivative method')
+            header['COVNPAR'] = (len(self.fit_global_parameter_info),
+                                 'Propagated scene parameters')
+            header['COVRANK'] = (factor_info.rank,
+                                 'Retained scene covariance rank')
+            header['COVSTAT'] = ('OK', 'Covariance status')
+            header['COVFORM'] = ('LOWER', 'Stored covariance triangle')
+            header['COVTYPE'] = ('TOTAL-WITHIN-SCOPE', 'Covariance contents')
+            header['COVCOND'] = (
+                factor_info.condition if np.isfinite(factor_info.condition)
+                else -1.0,
+                'Scene covariance condition; -1 is infinite',
+            )
+            header['COVCLIP'] = (factor_info.clipped,
+                                 'Tiny negative eigenvalue clipped')
+            header['COVPMIN'] = (factor_info.minimum_eigenvalue,
+                                 'Minimum scene covariance eigenvalue')
+            header['COVPMAX'] = (factor_info.maximum_eigenvalue,
+                                 'Maximum scene covariance eigenvalue')
+            header['COVPRIOR'] = (self.prior_scale > 0,
+                                  'Meta covariance includes priors')
+            header['COVPRSCL'] = (self.prior_scale,
+                                  'Meta-fit prior penalty scale')
+            header.add_history(
+                'Flux covariance uses a meta-fit scene block plus independent '
+                'native conditional coefficient variance.'
+            )
+            header.add_history(
+                'Input E3D covariance is treated as diagonal; upstream cube '
+                'resampling covariance is not propagated.'
+            )
+            header.add_history(
+                'Meta-fit priors are %s (prior scale %.8g).' %
+                ('included' if self.prior_scale > 0 else 'not included',
+                 self.prior_scale)
+            )
+            for parameter, step, stability, stencil in zip(
+                    self.fit_global_parameter_info, derivative_info.steps,
+                    derivative_info.stability, derivative_info.stencils):
+                header.add_history(
+                    'COVDER %s: h=%.8g stability=%.5g stencil=%s' %
+                    (parameter.name, step, stability, stencil)
+                )
 
+        outputs = [(self.point_source_spectrum, output_path, header,
+                    'point-source')]
         if self.has_sky:
-            # Save the sky spectrum
-            print("  Saving output sky spectrum to '%s'" % sky_output_path)
-            write_pysnifs_spectrum(self.sky_spectrum, sky_output_path, header)
+            outputs.append((self.sky_spectrum, sky_output_path, sky_header,
+                            'sky'))
+
+        if covariance_enabled:
+            staged = []
+            try:
+                # Fully serialize and validate every member of the output pair
+                # before replacing either destination.
+                for spectrum, path, output_header, label in outputs:
+                    directory = os.path.dirname(os.path.abspath(path))
+                    descriptor, temporary_path = tempfile.mkstemp(
+                        prefix='.%s.' % os.path.basename(path), suffix='.tmp',
+                        dir=directory,
+                    )
+                    os.close(descriptor)
+                    staged.append((temporary_path, path))
+                    print("  Staging output %s spectrum for '%s'" %
+                          (label, path))
+                    write_pysnifs_spectrum(spectrum, temporary_path,
+                                           output_header)
+                for temporary_path, path in staged:
+                    os.replace(temporary_path, path)
+            finally:
+                for temporary_path, path in staged:
+                    if os.path.exists(temporary_path):
+                        os.unlink(temporary_path)
+        else:
+            for spectrum, path, output_header, label in outputs:
+                print("  Saving output %s spectrum to '%s'" % (label, path))
+                write_pysnifs_spectrum(spectrum, path, output_header)
 
     @property
     def has_sky(self):

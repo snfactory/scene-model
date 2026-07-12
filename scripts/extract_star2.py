@@ -69,6 +69,9 @@ if __name__ == "__main__":
                       dest="least_squares", action="store_true",
                       help="Least-square fit [default is a chi2 fit]",
                       default=False)
+    parser.add_option("-V", "--covariance", action="store_true",
+                      default=False,
+                      help="Propagate scene-fit flux covariance (PSF only)")
     parser.add_option("--filterVariance", dest="filter_variance",
                       action="store_true", help="Apply a filter in wavelength "
                       "to the variance estimate to avoid Poisson biases.",
@@ -209,7 +212,8 @@ if __name__ == "__main__":
         fitter.meta_cube_model.WR_3d_fits(model_path, header=[])
 
     # Extract the point source spectrum
-    fitter.extract(method=opts.method, radius=opts.radius)
+    fitter.extract(method=opts.method, radius=opts.radius,
+                   covariance=opts.covariance)
 
     # Write the point source and background spectra to fits files.
     fitter.write_spectrum(opts.out, opts.sky)

@@ -707,7 +707,7 @@ class SceneModel(object):
         return prior_penalty
 
     def _calculate_coefficients(self, components, data, variance, mask,
-                                **parameters):
+                                return_covariance=False, **parameters):
         """Calculate the coefficients analytically given a list of components.
 
         This returns a list of component names, an array with the coefficient
@@ -741,6 +741,8 @@ class SceneModel(object):
         if len(parameter_names) == 0:
             # There are no coefficients that need to be analytically evaluated,
             # we're done.
+            if return_covariance:
+                return [], np.array([]), np.array([]), np.empty((0, 0))
             return {}, {}
 
         basis = np.vstack(basis).T
@@ -766,6 +768,8 @@ class SceneModel(object):
         values = np.dot(cov, beta)
         variances = np.diag(cov) + 0.
 
+        if return_covariance:
+            return parameter_names, values, variances, cov.copy()
         return parameter_names, values, variances
 
     def _apply_coefficients(self, components, **parameters):
@@ -1119,7 +1123,7 @@ class SceneModel(object):
 
     def extract(self, images, variances=None, method='psf', radius=None,
                 aperture_subsampling=16, amplitude_key='amplitude',
-                **parameters):
+                return_covariance=False, **parameters):
         """Extract the coefficent parameters from a set of images.
 
         Coefficients refer to any parameters in the model that scale a
@@ -1145,6 +1149,11 @@ class SceneModel(object):
         If you don't want the background to be subtracted, fix the background
         to 0 before calling this method.
         """
+        if return_covariance and method != 'psf':
+            raise SceneModelException(
+                "Coefficient covariance is only defined for PSF extraction"
+            )
+
         # Handle the case where we want to extract a single image. After this,
         # images and variances will always be a list of images and variances.
         if len(np.shape(images)) == 2:
@@ -1158,6 +1167,8 @@ class SceneModel(object):
                 variances = np.asarray(variances)
 
         extraction_results = []
+        coefficient_names = None
+        coefficient_covariances = []
 
         for idx in range(len(images)):
             # Update the model with any parameters that were passed in.
@@ -1194,14 +1205,27 @@ class SceneModel(object):
             )
 
             # Evaluate the coefficients analytically
-            coefficient_data = \
-                self._calculate_coefficients(
+            coefficient_data = self._calculate_coefficients(
                     components,
                     image_info['mask_data'],
                     image_info['mask_variance'],
                     image_info['mask'],
+                    return_covariance=return_covariance,
                     **eval_parameters
                 )
+
+            if return_covariance:
+                names, values, coefficient_variances, coefficient_covariance = \
+                    coefficient_data
+                current_names = tuple(names)
+                if coefficient_names is None:
+                    coefficient_names = current_names
+                elif current_names != coefficient_names:
+                    raise SceneModelException(
+                        "Coefficient ordering changed during extraction"
+                    )
+                coefficient_covariances.append(coefficient_covariance)
+                coefficient_data = names, values, coefficient_variances
 
             if method == "psf":
                 # We're done, use the fitted amplitude.
@@ -1231,7 +1255,17 @@ class SceneModel(object):
 
         extraction_results = Table(extraction_results)
 
-        return extraction_results
+        if not return_covariance:
+            return extraction_results
+
+        from .covariance import ExtractionResult
+        covariance_array = np.asarray(coefficient_covariances)
+        covariance_array.setflags(write=False)
+        return ExtractionResult(
+            table=extraction_results,
+            coefficient_names=coefficient_names or tuple(),
+            coefficient_covariance=covariance_array,
+        )
 
     def _get_center_position(self, full_parameters):
         """Return the center position of the model for the given parameters

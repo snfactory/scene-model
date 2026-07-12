@@ -967,6 +967,20 @@ class MultipleImageFitter():
         return global_parameters
 
     @property
+    def global_fit_parameter_info(self):
+        """Return immutable descriptors in the fitter's declared order."""
+        from .covariance import GlobalParameter
+        return tuple(
+            GlobalParameter(
+                name=name,
+                value=float(parameter_dict['value']),
+                bounds=tuple(parameter_dict['bounds']),
+                scale=1.0,
+            )
+            for name, parameter_dict in self._global_fit_parameters.items()
+        )
+
+    @property
     def parameters(self):
         """Return the current value of all parameters that were included in the
         fit.
