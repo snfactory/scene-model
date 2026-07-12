@@ -29,16 +29,11 @@ from .covariance import assemble_flux_covariance, factor_covariance, \
 # If we are using autograd, then we need to use a special version of numpy.
 from .config import numpy as np
 
-# Import SNIFS libraries if available.
-try:
-    from ToolBox.Arrays import metaslice
-    from ToolBox.Astro import Coords
-    from ToolBox.Atmosphere import ADR
-    from ToolBox import MPL
-    import pySNIFS
-except ImportError as e:
-    print("WARNING: Unable to load SNIFS libraries! (%s)" % e)
-    print("Some functionality will be disabled.")
+from ._compat.arrays import metaslice
+from ._compat import coords as Coords
+from ._compat.atmosphere import ADR
+from ._compat import plotting as MPL
+from ._compat import snifs_io as pySNIFS
 
 
 rad_to_deg = 180. / np.pi
@@ -273,16 +268,15 @@ def power_law_jacobian(coeffs, x):
 
 
 def fit_power_law(x, y, deg=2, guess=None):
-    import ToolBox.Optimizer as TO
     if guess is None:
         guess = [0.] * (deg - 1) + [-1., 2.]
     else:
         assert len(guess) == (deg + 1)
 
-    model = TO.Model(evaluate_power_law, jac=power_law_jacobian)
-    data = TO.DataSet(y, x=x)
-    fit = TO.Fitter(model, data)
-    lsqPars, msg = leastsq(fit.residuals, guess, args=(x,))
+    def residuals(coefficients, values):
+        return evaluate_power_law(coefficients, values) - y
+
+    lsqPars, msg = leastsq(residuals, guess, args=(x,))
 
     if msg <= 4:
         return lsqPars

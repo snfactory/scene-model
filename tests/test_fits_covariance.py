@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 from astropy.io import fits
 
-import pySNIFS
+from scene_model._compat import snifs_io as pySNIFS
 from scene_model.snifs import write_pysnifs_spectrum
 
 

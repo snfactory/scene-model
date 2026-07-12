@@ -58,21 +58,11 @@ def test_usage_error_does_not_require_legacy_runtime(capsys):
     assert "No input datacube specified" in capsys.readouterr().err
 
 
-def test_vendored_scene_runtime_is_importable_and_python3_compatible(tmp_path):
-    from ToolBox.Arrays import rebin
-    from ToolBox.Astro.Coords import ten
-    from ToolBox.Misc import add_attrs
-    from pySNIFS import spectrum
+def test_private_scene_runtime_is_importable_and_python3_compatible(tmp_path):
+    from scene_model._compat.arrays import metaslice
+    from scene_model._compat.snifs_io import spectrum
 
-    assert rebin(np.arange(16).reshape(4, 4), (2, 2)).shape == (2, 2)
-    assert ten("-0:23:34") == pytest.approx(-0.3927777777777778)
-
-    @add_attrs(marker="ok")
-    def decorated():
-        return None
-
-    assert decorated.marker == "ok"
-
+    assert metaslice(15, 3, trim=2) == [3, 12, 3]
     output = tmp_path / "spectrum.fits"
     spectrum(
         data=np.arange(3.0), var=np.ones(3), start=1.0, step=2.0

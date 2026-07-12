@@ -1,13 +1,7 @@
-"""Small plotting subset required by :mod:`scene_model.snifs`.
-
-The color values match the Python 3 extract-star port.  Importing this module
-also installs ``Axes.errorband``, matching the historical ToolBox side effect.
-"""
+"""Private plotting colors and error-band helper used by scene-model."""
 
 import numpy as np
 from matplotlib.axes import Axes
-
-from .Misc import make_method
 
 blue = "#377EB8"
 red = "#E41A1C"
@@ -18,9 +12,9 @@ yellow = "#FFFF33"
 brown = "#A65628"
 
 
-@make_method(Axes)
 def errorband(ax, x, y, dy, color="b", alpha=0.3, label="_", **kwargs):
     """Plot values with a symmetric or asymmetric filled error band."""
+
     if len(x) != len(y):
         raise ValueError("x and y must have equal length")
     if not len(x):
@@ -44,3 +38,7 @@ def errorband(ax, x, y, dy, color="b", alpha=0.3, label="_", **kwargs):
         **kwargs,
     )
     return poly
+
+
+# Preserve the historical import side effect used by scene-model diagnostics.
+Axes.errorband = errorband
