@@ -1,5 +1,10 @@
 # Cov-M1 scene covariance validation report
 
+> Historical checkpoint: this report records the finite-difference runtime
+> failure before the exact production JAX maps were integrated.  See
+> [`JAX_SCENE_PRODUCTION_REPORT.md`](JAX_SCENE_PRODUCTION_REPORT.md) for the
+> current JAX runtime/RSS results and remaining gates.
+
 ## Decision
 
 The algebraic and real-cube execution checks pass, but the Cov-M1 feasibility

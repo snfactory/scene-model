@@ -1,5 +1,9 @@
 # Production JAX scene-covariance validation
 
+Current real-cube performance, batching tradeoffs, numerical differences, and
+remaining release gates are summarized in
+[`JAX_SCENE_PRODUCTION_REPORT.md`](JAX_SCENE_PRODUCTION_REPORT.md).
+
 Validation has two locked stages.  The runtime/RSS benchmark runs each B/R and
 classic/Fourier case in a fresh process.  The statistical runner then executes
 the eight-scenario refitted ensemble.  Both tools accept external E3D paths
@@ -13,6 +17,16 @@ python validation/benchmark_jax_scene_covariance.py \
   --blue /path/to/e3d_target_B.fits \
   --red /path/to/e3d_target_R.fits \
   --output validation/results/jax_benchmark.json
+```
+
+Add `--batched` to benchmark the optional locked 128-wavelength mode.  Compare
+batched and unbatched Jacobians/covariances directly with:
+
+```bash
+python validation/compare_jax_batching.py \
+  --blue /path/to/e3d_target_B.fits \
+  --red /path/to/e3d_target_R.fits \
+  --output validation/results/jax_batch_comparison.json
 ```
 
 For every channel/PSF case, covariance-enabled cold runtime (including JAX
