@@ -169,7 +169,7 @@ def test_fits3d_cube_construct_slice_and_dynamic_writer_roundtrip(tmp_path):
         4, 6, 5000.0, 2.0, 5006.0
     )
     np.testing.assert_array_equal(cube.lbda, [5000.0, 5002.0, 5004.0, 5006.0])
-    np.testing.assert_array_equal(cube.spec(ind=0), cube.data[:, 0])
+    np.testing.assert_array_equal(cube.data[:, 0], [2.0, 8.0, 14.0, 20.0])
     image = cube.slice2d(1, coord="p", nx=3, ny=3)
     np.testing.assert_array_equal(image[cube.j, cube.i], cube.data[1])
 
@@ -207,7 +207,7 @@ def _write_synthetic_e3d(path):
     return data, var
 
 
-def test_e3d_cube_construct_and_dynamic_writer_roundtrip(tmp_path, monkeypatch):
+def test_e3d_cube_construct_and_dynamic_writer_roundtrip(tmp_path):
     source = tmp_path / "source_e3d.fits"
     expected_data, expected_var = _write_synthetic_e3d(source)
     cube = SNIFS_cube(e3d_file=source)
@@ -220,14 +220,6 @@ def test_e3d_cube_construct_and_dynamic_writer_roundtrip(tmp_path, monkeypatch):
 
     cube.writeto = cube.WR_e3d_file
     output = tmp_path / "roundtrip_e3d.fits"
-    # The vendored writer still calls the removed astropy ``new_table`` API.
-    # Supply its exact modern equivalent so this contract reaches and locks
-    # the writer's data behavior; the minimization must remove this shim.
-    monkeypatch.setattr(
-        fits, "new_table", fits.BinTableHDU.from_columns, raising=False
-    )
-    monkeypatch.setattr(fits, "TRUE", True, raising=False)
-    monkeypatch.setattr(fits, "FALSE", False, raising=False)
     cube.writeto(output)
     restored = SNIFS_cube(e3d_file=output)
     np.testing.assert_array_equal(restored.data, cube.data)

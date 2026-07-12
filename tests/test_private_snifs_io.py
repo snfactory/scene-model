@@ -6,7 +6,6 @@ import numpy as np
 import pytest
 from astropy.io import fits
 
-import pySNIFS as legacy
 from scene_model._compat.snifs_io import SNIFS_cube, spectrum
 
 
@@ -72,84 +71,75 @@ def _write_e3d(path, *, variance=True):
 
 
 @pytest.mark.parametrize("with_variance", [False, True])
-def test_regular_spectrum_construct_and_roundtrip_matches_legacy(tmp_path, with_variance):
+def test_regular_spectrum_construct_and_roundtrip(tmp_path, with_variance):
     data = np.array([3.5, -2.0, 8.25])
     variance = np.array([0.4, 0.5, 0.9]) if with_variance else None
-    old = legacy.spectrum(data=data, var=variance, start=4100.0, step=2.5)
-    new = spectrum(data=data, var=variance, start=4100.0, step=2.5)
-    _assert_spectrum_equal(old, new)
+    original = spectrum(data=data, var=variance, start=4100.0, step=2.5)
 
-    old_path, new_path = tmp_path / "old.fits", tmp_path / "new.fits"
+    path = tmp_path / "spectrum.fits"
     header = [["OBJECT", "synthetic"]]
-    old.WR_fits_file(old_path, header_list=header)
-    new.WR_fits_file(new_path, header_list=header)
-    _assert_spectrum_equal(legacy.spectrum(data_file=old_path), spectrum(data_file=new_path))
-    assert fits.getheader(old_path)["OBJECT"] == fits.getheader(new_path)["OBJECT"]
-    assert len(fits.open(old_path)) == len(fits.open(new_path))
+    original.WR_fits_file(path, header_list=header)
+    _assert_spectrum_equal(original, spectrum(data_file=path))
+    assert fits.getheader(path)["OBJECT"] == "synthetic"
+    with fits.open(path) as hdus:
+        assert len(hdus) == (2 if with_variance else 1)
 
 
-def test_irregular_and_zero_spectrum_construction_matches_legacy():
-    _assert_spectrum_equal(
-        legacy.spectrum(x=[1.0, 1.7, 3.2]),
-        spectrum(x=[1.0, 1.7, 3.2]),
-    )
-    _assert_spectrum_equal(
-        legacy.spectrum(nx=4),
-        spectrum(nx=4),
-    )
+def test_irregular_and_zero_spectrum_construction():
+    irregular = spectrum(x=[1.0, 1.7, 3.2])
+    np.testing.assert_array_equal(irregular.x, [1.0, 1.7, 3.2])
+    np.testing.assert_array_equal(irregular.data, np.zeros(3))
+    zero = spectrum(nx=4)
+    np.testing.assert_array_equal(zero.data, np.zeros(4))
+    assert zero.len == 4
 
 
 @pytest.mark.parametrize("variance", [False, True])
 @pytest.mark.parametrize("sparse", [False, True])
-def test_fits3d_read_slice_and_roundtrip_matches_legacy(tmp_path, variance, sparse):
+def test_fits3d_read_slice_and_roundtrip(tmp_path, variance, sparse):
     source = tmp_path / "source.fits"
     _write_fits3d(source, variance=variance, sparse=sparse)
-    old, new = legacy.SNIFS_cube(fits3d_file=source), SNIFS_cube(fits3d_file=source)
-    _assert_cube_equal(old, new)
-    np.testing.assert_array_equal(
-        old.slice2d(1, coord="p"),
-        new.slice2d(1, coord="p"),
-    )
+    cube = SNIFS_cube(fits3d_file=source)
+    image = cube.slice2d(1, coord="p")
+    np.testing.assert_array_equal(image[cube.j, cube.i], cube.data[1])
+    assert cube.nlens == (8 if sparse else 9)
 
-    old_out, new_out = tmp_path / "old_cube.fits", tmp_path / "new_cube.fits"
-    old.writeto = old.WR_3d_fits
-    new.writeto = new.WR_3d_fits
-    old.writeto(old_out)
-    new.writeto(new_out)
-    _assert_cube_equal(
-        legacy.SNIFS_cube(fits3d_file=old_out),
-        SNIFS_cube(fits3d_file=new_out),
-    )
+    output = tmp_path / "roundtrip_cube.fits"
+    cube.writeto = cube.WR_3d_fits
+    cube.writeto(output)
+    restored = SNIFS_cube(fits3d_file=output)
+    np.testing.assert_array_equal(restored.data, cube.data)
+    if cube.var is None:
+        assert restored.var is None
+    else:
+        np.testing.assert_array_equal(restored.var, cube.var)
+    np.testing.assert_array_equal(restored.lbda, cube.lbda)
+    # FITS3D output is normalized onto the standard 15x15 SNIFS grid.
+    assert fits.getheader(output)["CRVAL1"] == pytest.approx(-7 * cube.spxSize)
+    assert fits.getheader(output)["CRVAL2"] == pytest.approx(-7 * cube.spxSize)
 
 
 @pytest.mark.parametrize("variance", [False, True])
-def test_e3d_read_and_modern_writer_roundtrip_matches_legacy(tmp_path, monkeypatch, variance):
+def test_e3d_read_and_modern_writer_roundtrip(tmp_path, variance):
     source = tmp_path / "source_e3d.fits"
     _write_e3d(source, variance=variance)
-    old, new = legacy.SNIFS_cube(e3d_file=source), SNIFS_cube(e3d_file=source)
-    _assert_cube_equal(old, new)
+    cube = SNIFS_cube(e3d_file=source)
 
-    # The legacy writer requires compatibility aliases removed from Astropy;
-    # the private writer uses their supported modern equivalents directly.
-    monkeypatch.setattr(fits, "new_table", fits.BinTableHDU.from_columns, raising=False)
-    monkeypatch.setattr(fits, "TRUE", True, raising=False)
-    monkeypatch.setattr(fits, "FALSE", False, raising=False)
-    old_out, new_out = tmp_path / "old_e3d.fits", tmp_path / "new_e3d.fits"
-    old.writeto = old.WR_e3d_file
-    new.writeto = new.WR_e3d_file
-    old.writeto(old_out)
-    new.writeto(new_out)
-    _assert_cube_equal(
-        legacy.SNIFS_cube(e3d_file=old_out),
-        SNIFS_cube(e3d_file=new_out),
-    )
-    with fits.open(new_out) as hdus:
+    output = tmp_path / "roundtrip_e3d.fits"
+    cube.writeto = cube.WR_e3d_file
+    cube.writeto(output)
+    _assert_cube_equal(cube, SNIFS_cube(e3d_file=output))
+    with fits.open(output) as hdus:
         assert hdus[0].header["EURO3D"]
         assert ("STAT_SPE" in hdus[1].columns.names) is variance
 
 
-def test_empty_model_cube_matches_legacy_and_rejects_nonlinear_wavelengths():
+def test_empty_model_cube_and_rejects_nonlinear_wavelengths():
     wavelengths = np.array([4000.0, 4002.0, 4004.0])
-    _assert_cube_equal(legacy.SNIFS_cube(lbda=wavelengths), SNIFS_cube(lbda=wavelengths))
+    cube = SNIFS_cube(lbda=wavelengths)
+    np.testing.assert_array_equal(cube.lbda, wavelengths)
+    assert (cube.nslice, cube.lstart, cube.lstep, cube.lend) == (
+        3, 4000.0, 2.0, 4004.0
+    )
     with pytest.raises(ValueError, match="not linear"):
         SNIFS_cube(lbda=[4000.0, 4002.0, 4005.0])

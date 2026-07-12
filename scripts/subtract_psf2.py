@@ -6,7 +6,7 @@ from __future__ import print_function
 
 import os
 import numpy as np
-import pySNIFS
+from scene_model._compat import snifs_io as pySNIFS
 from astropy.io import fits
 
 import scene_model

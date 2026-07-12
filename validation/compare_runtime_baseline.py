@@ -44,6 +44,20 @@ def _json_scalar(value):
     return str(value)
 
 
+def _flatten_fit_parameters(parameters):
+    """Return scalar parameter values with stable names for vector entries."""
+    flattened = {}
+    for name, value in sorted(parameters.items()):
+        array = np.asarray(value)
+        if array.ndim == 0:
+            flattened[name] = float(array)
+            continue
+        for index in np.ndindex(array.shape):
+            suffix = ",".join(str(item) for item in index)
+            flattened[f"{name}[{suffix}]"] = float(array[index])
+    return flattened
+
+
 def _worker(checkout, cube_path, psf, jacobian_backend):
     checkout = str(Path(checkout).resolve())
     sys.path.insert(0, checkout)
@@ -78,9 +92,7 @@ def _worker(checkout, cube_path, psf, jacobian_backend):
         in fitter.fit_scene_model.get_fits_header_items()
     }
     return {
-        "fit_parameters": {
-            key: float(value) for key, value in sorted(fitter.fit_parameters.items())
-        },
+        "fit_parameters": _flatten_fit_parameters(fitter.fit_parameters),
         "flux": np.asarray(fitter.point_source_spectrum.data).tolist(),
         "variance": np.asarray(fitter.point_source_spectrum.var).tolist(),
         "covariance": np.asarray(fitter.point_source_spectrum.cov).tolist(),

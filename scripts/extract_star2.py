@@ -151,7 +151,7 @@ if __name__ == "__main__":
     # Import the legacy SNfactory compatibility layer only after parsing and
     # validation, so metadata and usage errors do not require the runtime
     # adapter to be installed.
-    from ToolBox.Misc import warning2stdout
+    from scene_model._compat.warnings import warning2stdout
     warnings.showwarning = warning2stdout
 
     # Accounting
