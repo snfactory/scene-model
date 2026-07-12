@@ -1,8 +1,13 @@
 # Results and recommendation
 
-Run date: 2026-07-12, CPU backend, JAX/jaxlib 0.7.2, x64 enabled.
-Numba was not installed in the active environment. No dependency metadata or
-production files were changed.
+Initial run: 2026-07-12, CPU backend, JAX/jaxlib 0.7.2, x64 enabled.
+
+Migration rerun: 2026-07-12, macOS arm64 CPU, JAX/jaxlib 0.10.2, x64 enabled.
+The locked 0.10.2 profile passed all 36 scene-model and experiment tests. The
+779-slice classic and Fourier relative Frobenius errors were 8.15e-11 and
+8.33e-10. Hot Jacobians were 2.05x and 2.01x faster than the two-point finite
+difference oracle, with peak RSS of 510 MiB and 569 MiB. The production
+three-step stability policy needs roughly three times the oracle work.
 
 ## 779-slice isolated-process results
 

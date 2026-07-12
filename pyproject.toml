@@ -15,6 +15,7 @@ authors = [
 ]
 dependencies = [
     "astropy",
+    "jax==0.10.2",
     "matplotlib",
     "numpy",
     "scipy",
@@ -24,6 +25,9 @@ dependencies = [
 extract-star2 = "scene_model.cli:main"
 
 [project.optional-dependencies]
+cuda13 = [
+    "jax[cuda13]==0.10.2; sys_platform == 'linux' and platform_machine == 'x86_64'",
+]
 test = ["pytest>=8"]
 
 [tool.setuptools]
