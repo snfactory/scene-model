@@ -23,7 +23,7 @@ from .models import GaussianMoffatPsfElement, \
 from .fit import MultipleImageFitter
 from .prior import MultivariateGaussianPrior
 from .covariance import assemble_flux_covariance, factor_covariance, \
-    finite_difference_jacobian, select_marginal_covariance
+    finite_difference_jacobian, fixed_extraction_map, select_marginal_covariance
 
 # If we are using autograd, then we need to use a special version of numpy.
 from .config import numpy as np
@@ -2109,12 +2109,21 @@ class SnifsCubeFitter(object):
         if covariance:
             coefficient_names = extraction_result.coefficient_names
             coefficient_covariance = extraction_result.coefficient_covariance
+            coefficient_estimator = extraction_result.coefficient_estimator
             expected_covariance_shape = (
                 len(extraction), len(coefficient_names), len(coefficient_names)
             )
             if coefficient_covariance.shape != expected_covariance_shape:
                 raise SceneModelException(
                     "Native coefficient covariance axes are inconsistent"
+                )
+            expected_estimator_shape = (
+                len(extraction), len(coefficient_names),
+                cube_data.shape[1] * cube_data.shape[2],
+            )
+            if coefficient_estimator.shape != expected_estimator_shape:
+                raise SceneModelException(
+                    "Native fixed estimator axes are inconsistent"
                 )
             try:
                 amplitude_index = coefficient_names.index('amplitude')
@@ -2197,6 +2206,14 @@ class SnifsCubeFitter(object):
                 'derivatives': derivative_diagnostics,
                 'jacobian': jacobian,
                 'propagated_factor': propagated_factor,
+                # Per-wavelength maps preserve the fixed 225-spaxel axis.
+                # Consumers align this axis explicitly with Euro3D rows.
+                'coefficient_estimator': coefficient_estimator,
+                'coefficient_names': coefficient_names,
+                'fixed_input_shape': tuple(cube_data.shape),
+                'fixed_extraction_map': fixed_extraction_map(
+                    coefficient_estimator, amplitude_index
+                ),
             }
         self.point_source_spectrum = point_source_spectrum
 
@@ -2315,7 +2332,8 @@ class SnifsCubeFitter(object):
             header['COVMETH'] = ('2STAGE-LAPLACE', 'Covariance method')
             header['COVSCOPE'] = ('SCENE+NATIVE-DIAG', 'Included uncertainty')
             header['COVINPUT'] = ('E3D-STAT-DIAG', 'Input cube covariance')
-            header['COVDER'] = ('FINITE-DIFFERENCE', 'Flux derivative method')
+            header['COVDER'] = (derivative_info.backend.upper(),
+                                'Flux derivative method')
             header['COVNPAR'] = (len(self.fit_global_parameter_info),
                                  'Propagated scene parameters')
             header['COVRANK'] = (factor_info.rank,

@@ -707,7 +707,8 @@ class SceneModel(object):
         return prior_penalty
 
     def _calculate_coefficients(self, components, data, variance, mask,
-                                return_covariance=False, **parameters):
+                                return_covariance=False,
+                                return_estimator=False, **parameters):
         """Calculate the coefficients analytically given a list of components.
 
         This returns a list of component names, an array with the coefficient
@@ -742,7 +743,10 @@ class SceneModel(object):
             # There are no coefficients that need to be analytically evaluated,
             # we're done.
             if return_covariance:
-                return [], np.array([]), np.array([]), np.empty((0, 0))
+                result = ([], np.array([]), np.array([]), np.empty((0, 0)))
+                if return_estimator:
+                    return result + (np.empty((0, mask.size)),)
+                return result
             return {}, {}
 
         basis = np.vstack(basis).T
@@ -769,7 +773,17 @@ class SceneModel(object):
         variances = np.diag(cov) + 0.
 
         if return_covariance:
-            return parameter_names, values, variances, cov.copy()
+            result = (parameter_names, values, variances, cov.copy())
+            if return_estimator:
+                # Native fixed linear map d(coefficients)/d(image).  Keep the
+                # complete fixed pixel axis and represent rejected pixels by
+                # exact zeros so downstream axis alignment is explicit.
+                estimator_masked = np.dot(cov, basis.T / variance)
+                estimator = np.zeros((len(parameter_names), mask.size),
+                                     dtype=float)
+                estimator[:, np.asarray(mask).ravel()] = estimator_masked
+                return result + (estimator,)
+            return result
         return parameter_names, values, variances
 
     def _apply_coefficients(self, components, **parameters):
@@ -1169,6 +1183,7 @@ class SceneModel(object):
         extraction_results = []
         coefficient_names = None
         coefficient_covariances = []
+        coefficient_estimators = []
 
         for idx in range(len(images)):
             # Update the model with any parameters that were passed in.
@@ -1211,12 +1226,13 @@ class SceneModel(object):
                     image_info['mask_variance'],
                     image_info['mask'],
                     return_covariance=return_covariance,
+                    return_estimator=return_covariance,
                     **eval_parameters
                 )
 
             if return_covariance:
-                names, values, coefficient_variances, coefficient_covariance = \
-                    coefficient_data
+                (names, values, coefficient_variances,
+                 coefficient_covariance, coefficient_estimator) = coefficient_data
                 current_names = tuple(names)
                 if coefficient_names is None:
                     coefficient_names = current_names
@@ -1225,6 +1241,7 @@ class SceneModel(object):
                         "Coefficient ordering changed during extraction"
                     )
                 coefficient_covariances.append(coefficient_covariance)
+                coefficient_estimators.append(coefficient_estimator)
                 coefficient_data = names, values, coefficient_variances
 
             if method == "psf":
@@ -1260,11 +1277,14 @@ class SceneModel(object):
 
         from .covariance import ExtractionResult
         covariance_array = np.asarray(coefficient_covariances)
+        estimator_array = np.asarray(coefficient_estimators)
         covariance_array.setflags(write=False)
+        estimator_array.setflags(write=False)
         return ExtractionResult(
             table=extraction_results,
             coefficient_names=coefficient_names or tuple(),
             coefficient_covariance=covariance_array,
+            coefficient_estimator=estimator_array,
         )
 
     def _get_center_position(self, full_parameters):

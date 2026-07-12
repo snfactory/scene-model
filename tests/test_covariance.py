@@ -10,6 +10,7 @@ from scene_model.covariance import (
     assemble_flux_covariance,
     factor_covariance,
     finite_difference_jacobian,
+    fixed_extraction_map,
     select_marginal_covariance,
 )
 from scene_model.models import GaussianSceneModel
@@ -76,10 +77,43 @@ def test_structured_extraction_has_exact_legacy_table_parity():
 
     assert structured.coefficient_names == ("amplitude", "background")
     assert structured.coefficient_covariance.shape == (1, 2, 2)
+    assert structured.coefficient_estimator.shape == (1, 2, 25)
     assert structured.coefficient_covariance.flags.writeable is False
+    assert structured.coefficient_estimator.flags.writeable is False
     assert legacy.colnames == structured.table.colnames
     for name in legacy.colnames:
         assert np.array_equal(legacy[name], structured.table[name])
+    source = structured.coefficient_estimator[0, 0]
+    background = structured.coefficient_estimator[0, 1]
+    np.testing.assert_allclose(source @ image.ravel(), 7.0)
+    np.testing.assert_allclose(background @ image.ravel(), 1.5)
+
+
+def test_fixed_estimator_has_zero_columns_for_masked_pixels():
+    model = GaussianSceneModel(grid_size=(5, 5), subsampling=1, border=0)
+    parameters = dict(center_x=0.1, center_y=-0.2, sigma_x=0.9,
+                      sigma_y=1.1, rho=0.05)
+    image = model.evaluate(amplitude=7.0, background=1.5, **parameters)
+    variance = np.ones_like(image)
+    variance[1, 3] = np.nan
+    result = model.extract(image, variance, return_covariance=True, **parameters)
+    masked_column = np.ravel_multi_index((1, 3), image.shape)
+    assert np.array_equal(result.coefficient_estimator[0, :, masked_column],
+                          np.zeros(2))
+
+
+def test_native_fixed_map_reconstructs_all_wavelength_amplitudes():
+    model = GaussianSceneModel(grid_size=(5, 5), subsampling=1, border=0)
+    parameters = dict(center_x=0.1, center_y=-0.2, sigma_x=0.9,
+                      sigma_y=1.1, rho=0.05)
+    unit = model.evaluate(amplitude=1.0, background=0.0, **parameters)
+    images = np.array([3.0 * unit + 1.0, 8.0 * unit - 2.0])
+    result = model.extract(images, np.ones_like(images),
+                           return_covariance=True, **parameters)
+    amplitude = result.coefficient_names.index("amplitude")
+    matrix = fixed_extraction_map(result.coefficient_estimator, amplitude)
+    np.testing.assert_allclose(matrix @ images.ravel(), [3.0, 8.0])
+    assert matrix.shape == (2, 50)
 
 
 def test_flux_jacobian_matches_analytic_derivative_and_bound_stencil():
@@ -99,6 +133,7 @@ def test_flux_jacobian_matches_analytic_derivative_and_bound_stencil():
     np.testing.assert_allclose(jacobian, [[4.0, 3.0], [2.0, -1.0]],
                                rtol=2e-6, atol=2e-6)
     assert diagnostics.stencils == ("centered", "forward")
+    assert diagnostics.backend == "finite-difference"
     assert max(diagnostics.stability) <= 5e-3
 
 

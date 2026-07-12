@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-
 import numpy as np
 
 from .utils import SceneModelException
@@ -16,6 +15,7 @@ class ExtractionResult:
     table: object
     coefficient_names: tuple[str, ...]
     coefficient_covariance: np.ndarray
+    coefficient_estimator: np.ndarray
 
 
 @dataclass(frozen=True)
@@ -40,6 +40,8 @@ class JacobianDiagnostics:
     steps: tuple[float, ...]
     stability: tuple[float, ...]
     stencils: tuple[str, ...]
+    backend: str = "finite-difference"
+    provenance: tuple[tuple[str, str], ...] = ()
 
 
 def select_marginal_covariance(names, covariance, global_names):
@@ -203,7 +205,7 @@ def finite_difference_jacobian(evaluate_flux, parameters, covariance,
 
     return jacobian, JacobianDiagnostics(
         steps=tuple(used_steps), stability=tuple(stabilities),
-        stencils=tuple(stencils),
+        stencils=tuple(stencils), backend="finite-difference",
     )
 
 
@@ -239,3 +241,28 @@ def assemble_flux_covariance(conditional_variance, jacobian, factor):
                        rtol=1e-13, atol=0.0):
         raise SceneModelException("Assembled covariance diagonal is inconsistent")
     return covariance, propagated_factor
+
+
+def fixed_extraction_map(coefficient_estimator, coefficient: int):
+    """Return the native block-diagonal fixed extraction map ``H``.
+
+    Input columns use wavelength-major, fixed-spaxel-minor order.  Masked
+    spaxels remain present as zero columns.  This map is the derivative of the
+    accepted coefficient solve with scene parameters and decisions frozen.
+    """
+    from scipy import sparse
+
+    estimator = np.asarray(coefficient_estimator, dtype=np.float64)
+    if estimator.ndim != 3 or not 0 <= coefficient < estimator.shape[1]:
+        raise SceneModelException("Fixed coefficient estimator has invalid axes")
+    if not np.all(np.isfinite(estimator)):
+        raise SceneModelException("Fixed coefficient estimator is non-finite")
+    nwave, _, nspaxel = estimator.shape
+    values = estimator[:, coefficient, :]
+    rows = np.repeat(np.arange(nwave, dtype=np.int64), nspaxel)
+    columns = np.arange(nwave * nspaxel, dtype=np.int64)
+    matrix = sparse.csr_matrix(
+        (values.ravel(), (rows, columns)), shape=(nwave, nwave * nspaxel)
+    )
+    matrix.eliminate_zeros()
+    return matrix
