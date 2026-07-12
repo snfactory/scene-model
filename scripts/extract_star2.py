@@ -72,6 +72,11 @@ if __name__ == "__main__":
     parser.add_option("-V", "--covariance", action="store_true",
                       default=False,
                       help="Propagate scene-fit flux covariance (PSF only)")
+    parser.add_option("--jacobian-backend",
+                      choices=('finite-difference', 'jax'),
+                      default='finite-difference',
+                      help="Flux-covariance Jacobian backend "
+                      "(finite-difference|jax) [%default]")
     parser.add_option("--filterVariance", dest="filter_variance",
                       action="store_true", help="Apply a filter in wavelength "
                       "to the variance estimate to avoid Poisson biases.",
@@ -213,7 +218,8 @@ if __name__ == "__main__":
 
     # Extract the point source spectrum
     fitter.extract(method=opts.method, radius=opts.radius,
-                   covariance=opts.covariance)
+                   covariance=opts.covariance,
+                   jacobian_backend=opts.jacobian_backend)
 
     # Write the point source and background spectra to fits files.
     fitter.write_spectrum(opts.out, opts.sky)

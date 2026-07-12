@@ -39,3 +39,4 @@ def test_covariance_flag_is_documented_for_both_psf_modes(psf, capsys):
     help_text = capsys.readouterr().out
     assert "-V" in help_text
     assert "--covariance" in help_text
+    assert "--jacobian-backend" in help_text

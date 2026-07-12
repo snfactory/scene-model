@@ -23,7 +23,8 @@ from .models import GaussianMoffatPsfElement, \
 from .fit import MultipleImageFitter
 from .prior import MultivariateGaussianPrior
 from .covariance import assemble_flux_covariance, factor_covariance, \
-    finite_difference_jacobian, fixed_extraction_map, select_marginal_covariance
+    finite_difference_jacobian, fixed_extraction_map, JacobianDiagnostics, \
+    select_marginal_covariance
 
 # If we are using autograd, then we need to use a special version of numpy.
 from .config import numpy as np
@@ -2028,7 +2029,8 @@ class SnifsCubeFitter(object):
                 (fit_seeing_widths.min(),
                  self.meta_cube.lbda[fit_seeing_widths.argmin()]))
 
-    def extract(self, method='psf', radius=None, covariance=False, **kwargs):
+    def extract(self, method='psf', radius=None, covariance=False,
+                jacobian_backend='finite-difference', **kwargs):
         """Extract the PSF. See SceneModel.extract for details.
 
         If aperture photometry is being performed, radius is interpreted
@@ -2061,6 +2063,10 @@ class SnifsCubeFitter(object):
                            self.fit_global_parameter_info is None):
             raise SceneModelException(
                 "Complete meta-fit covariance is unavailable"
+            )
+        if jacobian_backend not in ('finite-difference', 'jax'):
+            raise SceneModelException(
+                "Unknown Jacobian backend %s" % jacobian_backend
             )
 
         if method == "psf":
@@ -2188,10 +2194,96 @@ class SnifsCubeFitter(object):
                     "Covariance evaluation changed accepted native flux"
                 )
 
-            jacobian, derivative_diagnostics = finite_difference_jacobian(
-                evaluate_flux, self.fit_global_parameter_info,
-                self.fit_global_covariance,
-            )
+            if jacobian_backend == 'finite-difference':
+                jacobian, derivative_diagnostics = finite_difference_jacobian(
+                    evaluate_flux, self.fit_global_parameter_info,
+                    self.fit_global_covariance,
+                )
+            else:
+                from .jax_backend import jax_runtime_provenance
+                from .jax_scene import (
+                    CLASSIC_PARAMETER_NAMES,
+                    FOURIER_PARAMETER_NAMES,
+                    FOURIER_PROFILE_NAMES,
+                    build_classic_fixed_arrays,
+                    build_fourier_fixed_arrays,
+                    build_polynomial_background_bases,
+                    classic_flux,
+                    classic_flux_jacobian,
+                    fourier_flux,
+                    fourier_flux_jacobian,
+                )
+
+                parameter_names = tuple(
+                    parameter.name for parameter in
+                    self.fit_global_parameter_info
+                )
+                background_bases = build_polynomial_background_bases(
+                    evaluation_model.grid_info['grid_x'],
+                    evaluation_model.grid_info['grid_y'],
+                    self.background_degree,
+                )
+                adr_scale = (
+                    evaluation_model.adr_element.adr_model.get_scale(
+                        fixed_wavelength
+                    ) / evaluation_model.adr_element.spaxel_size
+                )
+                if self.psf == 'classic':
+                    if set(parameter_names) != set(CLASSIC_PARAMETER_NAMES):
+                        raise SceneModelException(
+                            "Analytic Gaussian/Moffat JAX parameter names "
+                            "differ from the production fit"
+                        )
+                    fixed_jax = build_classic_fixed_arrays(
+                        fixed_data, fixed_variance, fixed_wavelength,
+                        adr_scale, evaluation_model.grid_info,
+                        background_bases, self.header['EFFTIME'],
+                    )
+                    jax_flux = classic_flux(
+                        baseline_values, parameter_names, fixed_jax
+                    )
+                    jacobian = classic_flux_jacobian(
+                        baseline_values, parameter_names, fixed_jax
+                    )
+                elif self.psf == 'fourier':
+                    if set(parameter_names) != set(FOURIER_PARAMETER_NAMES):
+                        raise SceneModelException(
+                            "Fourier-domain JAX parameter names differ from "
+                            "the production fit"
+                        )
+                    profile_constants = {
+                        name: evaluation_model.parameters[name]
+                        for name in FOURIER_PROFILE_NAMES
+                    }
+                    fixed_jax = build_fourier_fixed_arrays(
+                        fixed_data, fixed_variance, fixed_wavelength,
+                        adr_scale, evaluation_model.grid_info,
+                        background_bases, profile_constants,
+                    )
+                    jax_flux = fourier_flux(
+                        baseline_values, parameter_names, fixed_jax
+                    )
+                    jacobian = fourier_flux_jacobian(
+                        baseline_values, parameter_names, fixed_jax
+                    )
+                else:
+                    raise SceneModelException(
+                        "JAX covariance does not support PSF %s" % self.psf
+                    )
+                if jax_flux.shape != expected_flux.shape or not np.allclose(
+                        jax_flux, expected_flux, rtol=1e-12, atol=0.0):
+                    difference = (
+                        np.max(np.abs(jax_flux - expected_flux))
+                        if jax_flux.shape == expected_flux.shape else np.inf
+                    )
+                    raise SceneModelException(
+                        "JAX fixed-map baseline failed accepted NumPy parity "
+                        "(maximum absolute difference=%g)" % difference
+                    )
+                derivative_diagnostics = JacobianDiagnostics(
+                    steps=tuple(), stability=tuple(), stencils=tuple(),
+                    backend='jax', provenance=jax_runtime_provenance(),
+                )
             flux_covariance, propagated_factor = assemble_flux_covariance(
                 conditional_variance, jacobian, covariance_factor
             )
