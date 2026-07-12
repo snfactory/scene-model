@@ -171,6 +171,7 @@ def _empty_checkpoint(truth_flux, scenario, root_seed):
         "predicted_band_variances": np.empty((0, len(BAND_FRACTIONS))),
         "predicted_pair_covariances": np.empty((0, len(pairs))),
         "runtimes": np.empty(0),
+        "legacy_runtimes": np.empty(0),
         "peak_rss_bytes": np.empty(0, dtype=np.int64),
         "ranks": np.empty(0, dtype=np.int64),
         "maximum_derivative_stability": np.empty(0),
@@ -229,6 +230,7 @@ def _run_one_realization(scenario, nominal_fitter, truth_model, truth_flux,
     start = time.perf_counter()
     try:
         fitted = _fit(realization_path, scenario.psf, covariance=False)
+        legacy_runtime = time.perf_counter() - start
         flux_without = np.asarray(fitted.point_source_spectrum.data).copy()
         fitted.extract(method="psf", covariance=True)
         runtime = time.perf_counter() - start
@@ -243,6 +245,7 @@ def _run_one_realization(scenario, nominal_fitter, truth_model, truth_flux,
         "flux": flux,
         "covariance": covariance,
         "runtime": runtime,
+        "legacy_runtime": legacy_runtime,
         "rss": current_peak_rss_bytes(),
         "rank": factor.rank,
         "stability": max(derivatives.stability, default=0.0),
@@ -263,6 +266,7 @@ def _record(state, result, band_weights, pairs):
     ]))
     for key, value in (
         ("runtimes", result["runtime"]),
+        ("legacy_runtimes", result["legacy_runtime"]),
         ("peak_rss_bytes", result["rss"]),
         ("ranks", result["rank"]),
         ("maximum_derivative_stability", result["stability"]),
@@ -361,6 +365,7 @@ def _summarize(state, scenario, band_weights, pairs, legacy_seconds,
         state, band_weights, root_seed, scenario.index
     )
     correlations = _correlation_metrics(state, pairs)
+    runtime_ratios = state["runtimes"] / state["legacy_runtimes"]
     gates = {
         key: bool(low < metrics[key] < high)
         for key, (low, high) in BOUNDARIES.items()
@@ -368,8 +373,7 @@ def _summarize(state, scenario, band_weights, pairs, legacy_seconds,
     gates.update({
         "correlations": all(item["consistent"] for item in correlations),
         "peak_rss": int(np.max(state["peak_rss_bytes"])) < 4 * 1024**3,
-        "runtime": (float(np.median(state["runtimes"]))
-                    < 5.0 * legacy_seconds),
+        "runtime": float(np.median(runtime_ratios)) < 5.0,
         "flux_parity": bool(np.all(state["flux_parity"])),
         "derivative_stability": (
             float(np.max(state["maximum_derivative_stability"])) <= 5e-3
@@ -390,11 +394,14 @@ def _summarize(state, scenario, band_weights, pairs, legacy_seconds,
         "boundary_overlap": overlap,
         "correlations": correlations,
         "runtime_seconds": {
-            "legacy_reference": legacy_seconds,
+            "nominal_legacy_reference": legacy_seconds,
+            "median_corresponding_legacy": float(np.median(
+                state["legacy_runtimes"]
+            )),
             "median_covariance_enabled": float(np.median(state["runtimes"])),
             "maximum_covariance_enabled": float(np.max(state["runtimes"])),
-            "median_ratio": float(np.median(state["runtimes"])
-                                  / legacy_seconds),
+            "median_ratio": float(np.median(runtime_ratios)),
+            "maximum_ratio": float(np.max(runtime_ratios)),
         },
         "peak_rss_bytes": int(np.max(state["peak_rss_bytes"])),
         "covariance_rank": {
