@@ -32,3 +32,14 @@ def test_main_accepts_explicit_argv_and_restores_process_argv(capsys):
     output = capsys.readouterr().out
     assert "Usage:" in output
     assert "PSF model" in output
+
+
+def test_usage_error_does_not_require_legacy_runtime(capsys):
+    original = sys.argv
+
+    with pytest.raises(SystemExit) as excinfo:
+        main([])
+
+    assert excinfo.value.code == 2
+    assert sys.argv is original
+    assert "No input datacube specified" in capsys.readouterr().err

@@ -108,11 +108,6 @@ if __name__ == "__main__":
 
     opts, args = parser.parse_args()
 
-    # Import the legacy SNfactory compatibility layer only after option
-    # parsing, so metadata operations such as ``extract-star2 --help`` do not
-    # require the runtime adapter to be installed.
-    from ToolBox.Misc import warning2stdout
-    warnings.showwarning = warning2stdout
     if not opts.input:
         if args:
             opts.input = args[0]
@@ -138,6 +133,12 @@ if __name__ == "__main__":
 
     if opts.seeingPrior and not opts.usePriors:
         parser.error("Seeing prior requires prior usage (--usePriors > 0).")
+
+    # Import the legacy SNfactory compatibility layer only after parsing and
+    # validation, so metadata and usage errors do not require the runtime
+    # adapter to be installed.
+    from ToolBox.Misc import warning2stdout
+    warnings.showwarning = warning2stdout
 
     # Accounting
     if opts.accountant:
