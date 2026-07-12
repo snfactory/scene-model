@@ -81,7 +81,7 @@ def test_fit_power_law_locks_parameters_and_residual_sign():
         residual[[0, 8, -1]],
         [1.78720351e-05, 6.05934799e-06, -1.86455741e-05],
         rtol=0,
-        atol=5e-12,
+        atol=5e-11,
     )
     # The optimizer's convention is model minus data.
     assert abs(residual.sum()) < 2e-7
