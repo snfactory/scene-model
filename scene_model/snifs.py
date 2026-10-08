@@ -2107,7 +2107,8 @@ class SnifsCubeFitter(object):
         # for plain chi2 PSF extraction (no covariance); aperture,
         # least-squares and covariance extractions keep the NumPy path.
         self.extraction_backend = (
-            'jax' if (self.fit_backend == 'jax' and method == 'psf' and
+            'jax' if (getattr(self, 'fit_backend', 'numpy') == 'jax' and
+                      method == 'psf' and
                       not covariance and cube_var is not None)
             else 'numpy'
         )
@@ -2431,8 +2432,9 @@ class SnifsCubeFitter(object):
         header[p('BORD')] = (self.border, 'Model border')
 
         header[p('METH')] = (self.extraction_method, 'Extraction method')
-        header[p('FITBK')] = (self.fit_backend, 'Metaslice fit backend')
-        header[p('EXTBK')] = (self.extraction_backend,
+        header[p('FITBK')] = (getattr(self, 'fit_backend', 'numpy'),
+                              'Metaslice fit backend')
+        header[p('EXTBK')] = (getattr(self, 'extraction_backend', None) or 'numpy',
                               'Spectrum extraction backend')
         if self.extraction_radius is not None:
             header[p('APRAD')] = (self.extraction_radius,
