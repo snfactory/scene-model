@@ -238,3 +238,40 @@ def test_unsupported_configurations_raise():
     with pytest.raises(SceneModelException):
         scene_model_objective(model, ["amplitude"],
                               analytic_coefficients=True)
+
+
+@pytest.mark.parametrize("psf", ["fourier", "classic"])
+@pytest.mark.parametrize("analytic", [True, False])
+def test_structured_hessian_matches_full_jax_hessian(psf, analytic):
+    import jax
+    from scene_model.jax_fit import _chi2
+
+    fitter = _three_d(psf, priors=True)
+    names, x0, bounds, numpy_chi2, objective = _multi_setup(fitter, analytic)
+    arguments, static = objective._arguments(), objective._static()
+    full = np.asarray(jax.hessian(
+        lambda y: _chi2(y, arguments, **static))(x0))
+    np.testing.assert_allclose(objective.hessian(x0), full, rtol=1e-9,
+                               atol=1e-9 * np.max(np.abs(full)))
+
+
+@pytest.mark.parametrize("psf", ["fourier", "classic"])
+def test_jax_psf_extraction_matches_numpy(psf):
+    from scene_model.jax_fit import extract_psf
+
+    wavelengths = np.linspace(3500.0, 5100.0, 7)
+    model = _model(psf, wavelength_dependence=True, background_degree=0,
+                   adr_model=_LinearAdr(), spaxel_size=0.43)
+    model.set_parameters(update_derived=False, **TRUTH_3D[psf])
+    parameters = dict(TRUTH_3D[psf], wavelength=wavelengths,
+                      amplitude=np.linspace(80.0, 140.0, 7), background=1.2)
+    images, variances = _noisy(model.evaluate_multi(**parameters), 4)
+    images[2, 3, 4] = np.nan          # masked spaxel
+    variances[5, 7, 7] = 0.0          # masked spaxel
+    expected = model.extract(images, variances, method="psf",
+                             wavelength=wavelengths)
+    actual = extract_psf(model, images, variances, wavelengths, batch=4)
+    assert actual.colnames == expected.colnames
+    for name in expected.colnames:
+        np.testing.assert_allclose(np.asarray(actual[name]),
+                                   np.asarray(expected[name]), rtol=1e-10)

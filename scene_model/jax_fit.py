@@ -91,6 +91,27 @@ def _background_degree(scene_model):
         "coefficients %s" % (names,))
 
 
+def _model_constants(scene_model, psf):
+    """(profile constants, padded grids) of a SNIFS scene model."""
+    grid = scene_model.grid_info
+    if psf == "fourier":
+        parameters = scene_model.parameters
+        constants = np.asarray(
+            [float(parameters[name]) for name in FOURIER_PROFILE_NAMES])
+        grids = (np.asarray(grid["pad_grid_kx"], float),
+                 np.asarray(grid["pad_grid_ky"], float),
+                 np.asarray(grid["pad_ifft_shift"], complex))
+    else:
+        # beta/sigma/eta = c0 + c1 * alpha, set from the exposure time
+        element = next(e for e in scene_model.elements if hasattr(e, "beta0"))
+        constants = np.asarray([element.beta0, element.beta1, element.sigma0,
+                                element.sigma1, element.eta0, element.eta1])
+        grids = tuple(np.asarray(grid[k]) for k in (
+            "pad_grid_x", "pad_grid_y", "pad_grid_kx", "pad_grid_ky",
+            "pad_fft_shift", "pad_ifft_shift"))
+    return constants, grids
+
+
 @dataclass
 class _Image:
     data: np.ndarray            # (nx, ny), fit scale applied, 0 outside mask
@@ -233,23 +254,8 @@ class SceneObjective:
         self.background_bases = np.asarray(build_polynomial_background_bases(
             grid["grid_x"], grid["grid_y"], degree))
 
-        if self.psf == "fourier":
-            parameters = model0.parameters
-            self.profile_constants = np.asarray(
-                [float(parameters[name]) for name in FOURIER_PROFILE_NAMES])
-            self.grids = (np.asarray(grid["pad_grid_kx"], float),
-                          np.asarray(grid["pad_grid_ky"], float),
-                          np.asarray(grid["pad_ifft_shift"], complex))
-        else:
-            # beta/sigma/eta = c0 + c1 * alpha, set from the exposure time
-            psf_element = next(e for e in model0.elements
-                               if hasattr(e, "beta0"))
-            self.profile_constants = np.asarray(
-                [psf_element.beta0, psf_element.beta1, psf_element.sigma0,
-                 psf_element.sigma1, psf_element.eta0, psf_element.eta1])
-            self.grids = tuple(np.asarray(grid[k]) for k in (
-                "pad_grid_x", "pad_grid_y", "pad_grid_kx", "pad_grid_ky",
-                "pad_fft_shift", "pad_ifft_shift"))
+        self.profile_constants, self.grids = _model_constants(model0,
+                                                              self.psf)
 
         # Priors: (scale, canonical indices or flat slots, centre, inverse cov)
         self.priors = []
@@ -317,31 +323,49 @@ class SceneObjective:
 _STATIC = ("psf", "analytic", "native_shape", "subsampling", "border")
 
 
-def _chi2(x, a, *, psf, analytic, native_shape, subsampling, border):
-    """chi2 of one or several images; ``a`` holds the arrays of a
-    SceneObjective (see SceneObjective._arguments)."""
-    _, jnp = _ensure_jax()
-    theta = jnp.asarray(a["base_theta"]).at[a["theta_index"]].set(
-        x[a["theta_slots"]])
+def _sources(theta, a, *, psf, native_shape, subsampling, border):
+    """Unit-amplitude point-source images (nimage, nx, ny) for ``theta``."""
     if psf == "fourier":
-        sources = fourier_source_pixels(
+        return fourier_source_pixels(
             theta, a["wavelengths"], a["adr_scale"], *a["grids"],
             a["profile_constants"], native_shape=native_shape,
             subsampling=subsampling, border=border)
-    else:
-        sources = classic_source_pixels(
-            theta, a["wavelengths"], a["adr_scale"], *a["grids"],
-            a["profile_constants"], native_shape=native_shape,
-            subsampling=subsampling, border=border)
+    return classic_source_pixels(
+        theta, a["wavelengths"], a["adr_scale"], *a["grids"],
+        a["profile_constants"], native_shape=native_shape,
+        subsampling=subsampling, border=border)
 
-    nimage = a["data"].shape[0]
+
+def _design(theta, a, *, psf, native_shape, subsampling, border):
+    """(nimage, ncoefficient, npixel) design: source then background bases."""
+    _, jnp = _ensure_jax()
+    sources = _sources(theta, a, psf=psf, native_shape=native_shape,
+                       subsampling=subsampling, border=border)
+    nimage = sources.shape[0]
     npix = native_shape[0] * native_shape[1]
     bases = jnp.asarray(a["background_bases"])
     background = jnp.broadcast_to(
         bases[jnp.newaxis], (nimage,) + bases.shape,
     ).reshape(nimage, bases.shape[0], npix)
-    design = jnp.concatenate((sources.reshape(nimage, 1, npix), background),
-                             axis=1)
+    return jnp.concatenate((sources.reshape(nimage, 1, npix), background),
+                           axis=1)
+
+
+def _theta(x, a):
+    _, jnp = _ensure_jax()
+    return jnp.asarray(a["base_theta"]).at[a["theta_index"]].set(
+        x[a["theta_slots"]])
+
+
+def _chi2(x, a, *, psf, analytic, native_shape, subsampling, border):
+    """chi2 of one or several images; ``a`` holds the arrays of a
+    SceneObjective (see SceneObjective._arguments)."""
+    _, jnp = _ensure_jax()
+    theta = _theta(x, a)
+    design = _design(theta, a, psf=psf, native_shape=native_shape,
+                     subsampling=subsampling, border=border)
+    nimage = design.shape[0]
+    npix = native_shape[0] * native_shape[1]
     weight = a["inverse_variance"].reshape(nimage, npix)
     data = a["data"].reshape(nimage, npix)
     if analytic:
@@ -360,6 +384,45 @@ def _chi2(x, a, *, psf, analytic, native_shape, subsampling, border):
     return chi2
 
 
+def _hessian(x, a, *, psf, analytic, native_shape, subsampling, border):
+    """Exact Hessian of _chi2.
+
+    Hessian-vector products (one forward-over-reverse pass at a time, which
+    bounds peak memory) are taken only along the PSF-parameter directions;
+    they give those rows (and, by symmetry, columns) in full.  Coefficients
+    enter the model linearly, so the coefficient-coefficient block is exactly
+    2 D^T W D per image (zero between images).
+    """
+    jax, jnp = _ensure_jax()
+    static = dict(psf=psf, analytic=analytic, native_shape=native_shape,
+                  subsampling=subsampling, border=border)
+    gradient = jax.grad(lambda y: _chi2(y, a, **static))
+    n = x.shape[0]
+    theta_slots = a["theta_slots"]
+    k = theta_slots.shape[0]
+    directions = jnp.zeros((k, n), dtype=x.dtype).at[
+        jnp.arange(k), theta_slots].set(1.0)
+    rows = jax.lax.map(lambda v: jax.jvp(gradient, (x,), (v,))[1],
+                       directions)
+    hessian = jnp.zeros((n, n), dtype=x.dtype)
+    hessian = hessian.at[theta_slots, :].set(rows)
+    hessian = hessian.at[:, theta_slots].set(rows.T)
+    coefficient_slots = a["coefficient_slots"]
+    if not analytic and coefficient_slots.shape[0]:
+        design = _design(_theta(x, a), a, psf=psf, native_shape=native_shape,
+                         subsampling=subsampling, border=border)
+        nimage = design.shape[0]
+        weight = a["inverse_variance"].reshape(nimage, -1)
+        gram = 2.0 * jnp.einsum("ncp,np,ndp->ncd", design, weight, design)
+        index = a["coefficient_index"]
+        image, column = index[:, 0], index[:, 1]
+        block = gram[image[:, None], column[:, None], column[None, :]] * (
+            image[:, None] == image[None, :])
+        hessian = hessian.at[coefficient_slots[:, None],
+                             coefficient_slots[None, :]].set(block)
+    return hessian
+
+
 _COMPILED = {}
 
 
@@ -374,13 +437,7 @@ def _compiled(kind):
         elif kind == "value_and_grad":
             function = jax.value_and_grad(_chi2)
         elif kind == "hessian":
-            def function(x, a, **static):
-                # Hessian as a sequence of Hessian-vector products: one
-                # forward-over-reverse pass at a time bounds peak memory.
-                gradient = jax.grad(lambda y: _chi2(y, a, **static))
-                return jax.lax.map(
-                    lambda v: jax.jvp(gradient, (x,), (v,))[1],
-                    jnp.eye(x.shape[0], dtype=x.dtype))
+            function = _hessian
         else:
             raise SceneModelException("Unknown compiled kind %s" % kind)
         _COMPILED[kind] = jax.jit(function, static_argnames=_STATIC)
@@ -419,3 +476,98 @@ def multiple_image_objective(fitter, names, *, analytic_coefficients,
         analytic_coefficients=analytic_coefficients,
         apply_fit_scale=apply_fit_scale, priors_by_scale=priors,
         fixed_values=fixed)
+
+
+EXTRACTION_BATCH = 128
+
+
+def _extract_batch(theta, a, data, inverse_variance, *, psf, native_shape,
+                   subsampling, border):
+    """Per-wavelength weighted least squares for a fixed PSF: coefficient
+    values and their variances (diagonal of the inverse normal matrix)."""
+    _, jnp = _ensure_jax()
+    design = _design(theta, a, psf=psf, native_shape=native_shape,
+                     subsampling=subsampling, border=border)
+    nimage = design.shape[0]
+    weight = inverse_variance.reshape(nimage, -1)
+    data = data.reshape(nimage, -1)
+    normal = jnp.einsum("ncp,np,ndp->ncd", design, weight, design)
+    rhs = jnp.einsum("ncp,np,np->nc", design, weight, data)
+    covariance = jnp.linalg.inv(normal)
+    values = jnp.einsum("ncd,nd->nc", covariance, rhs)
+    return values, jnp.diagonal(covariance, axis1=1, axis2=2)
+
+
+def extract_psf(scene_model, images, variances, wavelengths, *,
+                batch=EXTRACTION_BATCH):
+    """JAX version of ``SceneModel.extract(images, variances, method='psf',
+    wavelength=wavelengths)`` for a fitted, wavelength-dependent SNIFS
+    scene model (chi2 extraction, no covariance).  Same pixel mask
+    (non-NaN image and positive variance) and same output columns."""
+    from astropy.table import Table
+    jax, jnp = _ensure_jax()
+    psf = _psf_kind(scene_model)
+    if not scene_model.wavelength_dependence:
+        raise SceneModelException("JAX extraction needs the 3D scene model")
+    if variances is None:
+        raise SceneModelException("JAX extraction needs statistical variances")
+    degree, coefficient_names = _background_degree(scene_model)
+    for name, info in scene_model._coefficient_info.items():
+        if info["fixed"]:
+            raise SceneModelException(
+                "Fixed coefficient %s is not supported" % name)
+    images = np.asarray(images, float)
+    variances = np.asarray(variances, float)
+    wavelengths = np.asarray(wavelengths, float)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        mask = ~np.isnan(images) & (variances > 0)
+        data = np.where(mask, images, 0.0)
+        inverse_variance = np.where(mask, 1.0 / variances, 0.0)
+    if not mask.reshape(len(images), -1).any(axis=1).all():
+        raise SceneModelException("A wavelength slice has no valid spaxel")
+
+    canonical = _CANONICAL[psf]
+    theta = np.asarray([float(scene_model[name]) for name in canonical])
+    adr = scene_model.adr_element
+    adr_scale = np.ravel(adr.adr_model.get_scale(wavelengths)) / \
+        adr.spaxel_size
+    constants, grids = _model_constants(scene_model, psf)
+    grid = scene_model.grid_info
+    bases = np.asarray(build_polynomial_background_bases(
+        grid["grid_x"], grid["grid_y"], degree))
+    static = dict(psf=psf, native_shape=tuple(images.shape[1:]),
+                  subsampling=int(grid["subsampling"]),
+                  border=int(grid["border"]))
+    if "extract" not in _COMPILED:
+        _COMPILED["extract"] = jax.jit(
+            _extract_batch, static_argnames=("psf", "native_shape",
+                                             "subsampling", "border"))
+    function = _COMPILED["extract"]
+
+    nwave = len(wavelengths)
+    values, variances_out = [], []
+    for start in range(0, nwave, batch):
+        stop = min(start + batch, nwave)
+        pad = batch - (stop - start)   # fixed batch shape: one compilation
+
+        def padded(array, fill):
+            if not pad:
+                return array[start:stop]
+            filler = np.full((pad,) + array.shape[1:], fill)
+            return np.concatenate([array[start:stop], filler])
+        a = dict(wavelengths=padded(wavelengths, REFERENCE_WAVELENGTH),
+                 adr_scale=padded(adr_scale, 0.0), grids=grids,
+                 profile_constants=constants, background_bases=bases)
+        v, var = function(theta, a, padded(data, 0.0),
+                          padded(inverse_variance, 1.0), **static)
+        values.append(np.asarray(v)[:stop - start])
+        variances_out.append(np.asarray(var)[:stop - start])
+    values = np.concatenate(values)
+    variances_out = np.concatenate(variances_out)
+    if not (np.all(np.isfinite(values)) and np.all(np.isfinite(variances_out))):
+        raise SceneModelException("JAX extraction produced non-finite values")
+    table = Table()
+    for column, name in enumerate(coefficient_names):
+        table[name] = values[:, column]
+        table["%s_variance" % name] = variances_out[:, column]
+    return table

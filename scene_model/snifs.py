@@ -1285,6 +1285,7 @@ class SnifsCubeFitter(object):
         self.covariance_method = (
             'jax' if fit_backend == 'jax' else config.default_covariance_method
         )
+        self.extraction_backend = None
 
         self._read_cube(path)
         self._setup_psf(psf, prior_scale=prior_scale,
@@ -2102,11 +2103,25 @@ class SnifsCubeFitter(object):
         else:
             pixel_radius = None
 
-        extraction_result = self.fit_scene_model.extract(
-            cube_data, cube_var, method=method, radius=pixel_radius,
-            wavelength=self.cube.lbda,
-            return_covariance=covariance,
+        # The JAX backend also replaces the per-wavelength NumPy evaluation
+        # for plain chi2 PSF extraction (no covariance); aperture,
+        # least-squares and covariance extractions keep the NumPy path.
+        self.extraction_backend = (
+            'jax' if (self.fit_backend == 'jax' and method == 'psf' and
+                      not covariance and cube_var is not None)
+            else 'numpy'
         )
+        if self.extraction_backend == 'jax':
+            from .jax_fit import extract_psf
+            extraction_result = extract_psf(
+                self.fit_scene_model, cube_data, cube_var, self.cube.lbda
+            )
+        else:
+            extraction_result = self.fit_scene_model.extract(
+                cube_data, cube_var, method=method, radius=pixel_radius,
+                wavelength=self.cube.lbda,
+                return_covariance=covariance,
+            )
         if covariance:
             extraction = extraction_result.table
         else:
@@ -2417,6 +2432,8 @@ class SnifsCubeFitter(object):
 
         header[p('METH')] = (self.extraction_method, 'Extraction method')
         header[p('FITBK')] = (self.fit_backend, 'Metaslice fit backend')
+        header[p('EXTBK')] = (self.extraction_backend,
+                              'Spectrum extraction backend')
         if self.extraction_radius is not None:
             header[p('APRAD')] = (self.extraction_radius,
                                   'Aperture radius [" or sigma]')
