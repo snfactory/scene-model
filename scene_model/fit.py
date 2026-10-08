@@ -915,11 +915,13 @@ class MultipleImageFitter():
             )
 
         if method == 'jax':
-            from .jax_fit import multiple_image_objective
+            from .jax_fit import covariance_from_hessian, \
+                multiple_image_objective
             objective = multiple_image_objective(
                 self, parameter_names, analytic_coefficients=False,
             )
-            cov = hessian_to_covariance(objective.hessian(parameter_values))
+            cov = covariance_from_hessian(
+                objective.hessian(parameter_values), parameter_names)
         else:
             cov = calculate_covariance(chi_square_flat, method,
                                        parameter_names, parameter_values,

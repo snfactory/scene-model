@@ -301,3 +301,16 @@ def test_fourier_space_subpixel_folding_matches_fft_binning(psf, subsampling,
                                  fold=fold)) for fold in (False, True)]
     np.testing.assert_allclose(images[1], images[0], rtol=0,
                                atol=1e-13 * np.max(np.abs(images[0])))
+
+
+def test_degenerate_curvature_raises_scene_model_exception():
+    from scene_model.jax_fit import covariance_from_hessian
+
+    hessian = np.diag([4.0, 0.0, 2.0])
+    with pytest.raises(SceneModelException, match="xy"):
+        covariance_from_hessian(hessian, ["center_x", "xy", "ell"])
+    with pytest.raises(SceneModelException):
+        covariance_from_hessian(np.diag([1.0, np.nan]), ["a", "b"])
+    np.testing.assert_allclose(
+        covariance_from_hessian(np.diag([4.0, 2.0]), ["a", "b"]),
+        np.diag([0.5, 1.0]))

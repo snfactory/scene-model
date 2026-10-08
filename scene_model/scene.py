@@ -953,11 +953,13 @@ class SceneModel(object):
             )
 
         if method == 'jax':
-            from .jax_fit import scene_model_objective
+            from .jax_fit import covariance_from_hessian, \
+                scene_model_objective
             objective = scene_model_objective(
                 self, parameter_names, analytic_coefficients=False,
             )
-            cov = fit.hessian_to_covariance(objective.hessian(values))
+            cov = covariance_from_hessian(objective.hessian(values),
+                                          parameter_names)
         else:
             cov = fit.calculate_covariance(evaluate_chi_square, method,
                                            parameter_names, values, bounds,

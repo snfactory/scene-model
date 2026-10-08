@@ -452,6 +452,26 @@ def _compiled(kind):
     return _COMPILED[kind]
 
 
+def covariance_from_hessian(hessian, names):
+    """Covariance from an exact chi2 Hessian (fit.hessian_to_covariance).
+
+    A parameter with zero or negative exact curvature (e.g. one that a
+    clipped or bounded model no longer depends on, as in a degenerate fit
+    that has run off the field) has no defined uncertainty; this raises the
+    usual SceneModelException so callers treat it as a failed fit, instead
+    of letting the normalised inversion divide by zero."""
+    from .fit import hessian_to_covariance
+    hessian = np.asarray(hessian, dtype=np.float64)
+    diagonal = np.diag(hessian)
+    bad = [name for name, value in zip(names, diagonal)
+           if not np.isfinite(value) or value <= 0]
+    if bad or not np.all(np.isfinite(hessian)):
+        raise SceneModelException(
+            "Degenerate fit: no positive chi2 curvature for %s"
+            % (", ".join(bad) or "non-finite Hessian"))
+    return hessian_to_covariance(hessian)
+
+
 def scene_model_objective(scene_model, names, *, analytic_coefficients,
                           apply_fit_scale=True, apply_priors=True):
     """Objective matching SceneModel.chi_square for a single model."""
