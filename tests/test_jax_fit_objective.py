@@ -275,3 +275,29 @@ def test_jax_psf_extraction_matches_numpy(psf):
     for name in expected.colnames:
         np.testing.assert_allclose(np.asarray(actual[name]),
                                    np.asarray(expected[name]), rtol=1e-10)
+
+
+@pytest.mark.parametrize("psf", ["fourier", "classic"])
+@pytest.mark.parametrize("subsampling,border", [(3, 5), (4, 0), (16, 15)])
+def test_fourier_space_subpixel_folding_matches_fft_binning(psf, subsampling,
+                                                            border):
+    from scene_model.jax_fit import _model_constants
+    from scene_model.jax_scene import (classic_source_pixels,
+                                       fourier_source_pixels)
+
+    model = (SnifsFourierSceneModel if psf == "fourier" else
+             SnifsClassicSceneModel)(
+        **({} if psf == "fourier" else {"exposure_time": 20.0}),
+        grid_size=(15, 15), subsampling=subsampling, border=border)
+    constants, grids = _model_constants(model, psf)
+    theta = np.array(list(TRUTH_3D[psf].values()), float)
+    wavelengths = np.linspace(3600.0, 9000.0, 3)
+    adr_scale = (wavelengths - 5000.0) / 10000.0
+    builder = fourier_source_pixels if psf == "fourier" else \
+        classic_source_pixels
+    images = [np.asarray(builder(theta, wavelengths, adr_scale, *grids,
+                                 constants, native_shape=(15, 15),
+                                 subsampling=subsampling, border=border,
+                                 fold=fold)) for fold in (False, True)]
+    np.testing.assert_allclose(images[1], images[0], rtol=0,
+                               atol=1e-13 * np.max(np.abs(images[0])))

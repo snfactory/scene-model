@@ -126,6 +126,7 @@ class ClassicFixedArrays:
             )
         if self.profile_constants.shape != (6,):
             raise SceneModelException("Classic profile constants are invalid")
+        check_separable_grid(self.pad_grid_kx, self.pad_grid_ky)
         for field in fields(self):
             value = getattr(self, field.name)
             if isinstance(value, np.ndarray) and not np.all(np.isfinite(value)):
@@ -195,6 +196,7 @@ class FourierFixedArrays:
             )
         if self.profile_constants.shape != (len(FOURIER_PROFILE_NAMES),):
             raise SceneModelException("Fourier profile constants are invalid")
+        check_separable_grid(self.pad_grid_kx, self.pad_grid_ky)
         for field in fields(self):
             value = getattr(self, field.name)
             if isinstance(value, np.ndarray) and not np.all(np.isfinite(value)):
@@ -342,10 +344,72 @@ def _ensure_jax():
     return jax, jnp
 
 
+def check_separable_grid(pad_grid_kx, pad_grid_ky):
+    """The source builders factor exp(-i(x kx + y ky)) per axis, which needs
+    kx to vary only along axis 0 and ky only along axis 1 (an 'ij' grid)."""
+    pad_grid_kx = np.asarray(pad_grid_kx)
+    pad_grid_ky = np.asarray(pad_grid_ky)
+    if not (np.array_equal(pad_grid_kx, np.broadcast_to(
+            pad_grid_kx[:, :1], pad_grid_kx.shape)) and np.array_equal(
+            pad_grid_ky, np.broadcast_to(pad_grid_ky[:1, :],
+                                         pad_grid_ky.shape))):
+        raise SceneModelException("Frequency grid is not separable")
+
+
+def _shift_phase(shift_x, shift_y, pad_grid_kx, pad_grid_ky):
+    """exp(-i (shift_x kx + shift_y ky)) per wavelength, built from two 1D
+    factors (exact; kx depends on axis 0 only, ky on axis 1 only)."""
+    _, jnp = _ensure_jax()
+    kx = pad_grid_kx[:, 0]
+    ky = pad_grid_ky[0, :]
+    phase_x = jnp.exp(-1j * shift_x[:, jnp.newaxis] * kx[jnp.newaxis, :])
+    phase_y = jnp.exp(-1j * shift_y[:, jnp.newaxis] * ky[jnp.newaxis, :])
+    return phase_x[:, :, jnp.newaxis] * phase_y[:, jnp.newaxis, :]
+
+
+@lru_cache(maxsize=8)
+def _fold_weights(expanded_x, expanded_y, subsampling):
+    """Weights for summing subsampling x subsampling subpixels directly in
+    Fourier space: per axis D[k] = sum_{j<s} exp(2 pi i k j / N), N = M s."""
+    def dirichlet(native):
+        size = native * subsampling
+        k = np.arange(size)[:, np.newaxis]
+        j = np.arange(subsampling)[np.newaxis, :]
+        return np.exp(2j * np.pi * k * j / size).sum(axis=1)
+    weights = np.outer(dirichlet(expanded_x), dirichlet(expanded_y))
+    weights /= subsampling**2
+    weights.setflags(write=False)
+    return weights
+
+
+def _spectrum_to_pixels(spectrum, native_shape, subsampling, border, fold):
+    """Native-spaxel images of real(ifft2(spectrum)) summed over subpixels.
+
+    fold=False: inverse FFT on the subsampled grid, then sum subpixels.
+    fold=True: alias the spectrum onto the native grid (k = q + M r) with
+    the Dirichlet weights, then a native-size inverse FFT.  Identical up to
+    rounding; faster under reverse-mode differentiation."""
+    _, jnp = _ensure_jax()
+    if not fold:
+        return _bin_subpixels(jnp.real(jnp.fft.ifft2(spectrum, axes=(-2, -1))),
+                              native_shape, subsampling, border)
+    nwave = spectrum.shape[0]
+    expanded_x = native_shape[0] + 2 * border
+    expanded_y = native_shape[1] + 2 * border
+    weights = jnp.asarray(_fold_weights(expanded_x, expanded_y, subsampling))
+    aliased = (spectrum * weights[jnp.newaxis]).reshape(
+        nwave, subsampling, expanded_x, subsampling, expanded_y
+    ).sum(axis=(1, 3))
+    pixels = jnp.real(jnp.fft.ifft2(aliased, axes=(-2, -1)))
+    if border:
+        pixels = pixels[:, border:-border, border:-border]
+    return pixels
+
+
 def classic_source_pixels(canonical_parameters, wavelengths, adr_scale,
                           pad_grid_x, pad_grid_y, pad_grid_kx, pad_grid_ky,
                           pad_fft_shift, pad_ifft_shift, profile_constants,
-                          *, native_shape, subsampling, border):
+                          *, native_shape, subsampling, border, fold=False):
     """Unit-amplitude classic point-source images, one per wavelength."""
     _, jnp = _ensure_jax()
     (ref_center_x, ref_center_y, adr_delta, adr_theta,
@@ -384,20 +448,14 @@ def classic_source_pixels(canonical_parameters, wavelengths, adr_scale,
         jnp.fft.fft2(profile, axes=(-2, -1))
         * pad_fft_shift[jnp.newaxis, :, :]
     )
-    point_source = jnp.exp(-1j * (
-        ref_center_x * pad_grid_kx + ref_center_y * pad_grid_ky
-    ))
-    shift_x = adr_delta * jnp.sin(adr_theta) * adr_scale
-    shift_y = -adr_delta * jnp.cos(adr_theta) * adr_scale
-    adr = jnp.exp(-1j * (
-        shift_x[:, jnp.newaxis, jnp.newaxis] * pad_grid_kx
-        + shift_y[:, jnp.newaxis, jnp.newaxis] * pad_grid_ky
-    ))
-    source_fourier = profile_fourier * point_source * adr
-    source_subpixels = jnp.real(jnp.fft.ifft2(
-        source_fourier * pad_ifft_shift[jnp.newaxis, :, :], axes=(-2, -1)
-    ))
-    return _bin_subpixels(source_subpixels, native_shape, subsampling, border)
+    # point-source position plus ADR shift, as one separable phase
+    shift_x = ref_center_x + adr_delta * jnp.sin(adr_theta) * adr_scale
+    shift_y = ref_center_y - adr_delta * jnp.cos(adr_theta) * adr_scale
+    source_fourier = profile_fourier * _shift_phase(
+        shift_x, shift_y, pad_grid_kx, pad_grid_ky)
+    return _spectrum_to_pixels(
+        source_fourier * pad_ifft_shift[jnp.newaxis, :, :], native_shape,
+        subsampling, border, fold)
 
 
 def _bin_subpixels(source_subpixels, native_shape, subsampling, border):
@@ -548,7 +606,7 @@ def classic_flux_jacobian(parameter_values, parameter_names, fixed):
 def fourier_source_pixels(canonical_parameters, wavelengths, adr_scale,
                           pad_grid_kx, pad_grid_ky, pad_ifft_shift,
                           profile_constants, *, native_shape, subsampling,
-                          border):
+                          border, fold=False):
     """Unit-amplitude Fourier point-source images, one per wavelength."""
     _, jnp = _ensure_jax()
     (ref_center_x, ref_center_y, adr_delta, adr_theta,
@@ -557,9 +615,6 @@ def fourier_source_pixels(canonical_parameters, wavelengths, adr_scale,
     (inst_core_sigma_x, inst_core_sigma_y, inst_core_rho,
      inst_wings_power, inst_wings_width, seeing_power) = profile_constants
 
-    point_source = jnp.exp(-1j * (
-        ref_center_x * pad_grid_kx + ref_center_y * pad_grid_ky
-    ))
     instrumental_core = jnp.exp(-0.5 * (
         pad_grid_kx**2 * inst_core_sigma_x**2
         + pad_grid_ky**2 * inst_core_sigma_y**2
@@ -572,18 +627,17 @@ def fourier_source_pixels(canonical_parameters, wavelengths, adr_scale,
         * radial_frequency**inst_wings_power
     )
 
-    shift_x = adr_delta * jnp.sin(adr_theta) * adr_scale
-    shift_y = -adr_delta * jnp.cos(adr_theta) * adr_scale
-    adr = jnp.exp(-1j * (
-        shift_x[:, jnp.newaxis, jnp.newaxis] * pad_grid_kx
-        + shift_y[:, jnp.newaxis, jnp.newaxis] * pad_grid_ky
-    ))
+    # point-source position plus ADR shift, as one separable phase
+    shift_x = ref_center_x + adr_delta * jnp.sin(adr_theta) * adr_scale
+    shift_y = ref_center_y - adr_delta * jnp.cos(adr_theta) * adr_scale
+    phase = _shift_phase(shift_x, shift_y, pad_grid_kx, pad_grid_ky)
     seeing_width = seeing_ref_width * (
         wavelengths / REFERENCE_WAVELENGTH
     )**seeing_ref_power
+    # |k|**power once, not per wavelength
     seeing = jnp.exp(
         -seeing_width[:, jnp.newaxis, jnp.newaxis]**seeing_power
-        * radial_frequency[jnp.newaxis, :, :]**seeing_power
+        * (radial_frequency**seeing_power)[jnp.newaxis, :, :]
     )
     tracking = jnp.exp(-0.5 * (
         pad_grid_kx**2 * ellipticity_x**2
@@ -595,19 +649,11 @@ def fourier_source_pixels(canonical_parameters, wavelengths, adr_scale,
         jnp.sinc(pad_grid_kx / jnp.pi / 2.0 / subsampling)
         * jnp.sinc(pad_grid_ky / jnp.pi / 2.0 / subsampling)
     )
-    source_fourier = (
-        point_source[jnp.newaxis, :, :]
-        * instrumental_core[jnp.newaxis, :, :]
-        * instrumental_wings[jnp.newaxis, :, :]
-        * adr
-        * seeing
-        * tracking[jnp.newaxis, :, :]
-        * fourier_pixel[jnp.newaxis, :, :]
-    )
-    source_subpixels = jnp.real(jnp.fft.ifft2(
-        source_fourier * pad_ifft_shift[jnp.newaxis, :, :], axes=(-2, -1)
-    ))
-    return _bin_subpixels(source_subpixels, native_shape, subsampling, border)
+    static = (instrumental_core * instrumental_wings * tracking
+              * fourier_pixel * pad_ifft_shift)
+    source_fourier = phase * seeing * static[jnp.newaxis, :, :]
+    return _spectrum_to_pixels(source_fourier, native_shape, subsampling,
+                               border, fold)
 
 
 def _fourier_flux_impl(canonical_parameters, data, inverse_variance,

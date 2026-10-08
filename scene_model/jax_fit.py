@@ -32,6 +32,7 @@ from .jax_scene import (
     REFERENCE_WAVELENGTH,
     _ensure_jax,
     build_polynomial_background_bases,
+    check_separable_grid,
     classic_source_pixels,
     fourier_source_pixels,
 )
@@ -94,6 +95,7 @@ def _background_degree(scene_model):
 def _model_constants(scene_model, psf):
     """(profile constants, padded grids) of a SNIFS scene model."""
     grid = scene_model.grid_info
+    check_separable_grid(grid["pad_grid_kx"], grid["pad_grid_ky"])
     if psf == "fourier":
         parameters = scene_model.parameters
         constants = np.asarray(
@@ -323,24 +325,30 @@ class SceneObjective:
 _STATIC = ("psf", "analytic", "native_shape", "subsampling", "border")
 
 
-def _sources(theta, a, *, psf, native_shape, subsampling, border):
-    """Unit-amplitude point-source images (nimage, nx, ny) for ``theta``."""
+def _sources(theta, a, *, psf, native_shape, subsampling, border,
+             fold=True):
+    """Unit-amplitude point-source images (nimage, nx, ny) for ``theta``.
+
+    fold=True (Fourier-space subpixel summation) is used for the
+    differentiated objectives, where it is faster; extraction is forward
+    only and uses the inverse FFT on the subsampled grid."""
     if psf == "fourier":
         return fourier_source_pixels(
             theta, a["wavelengths"], a["adr_scale"], *a["grids"],
             a["profile_constants"], native_shape=native_shape,
-            subsampling=subsampling, border=border)
+            subsampling=subsampling, border=border, fold=fold)
     return classic_source_pixels(
         theta, a["wavelengths"], a["adr_scale"], *a["grids"],
         a["profile_constants"], native_shape=native_shape,
-        subsampling=subsampling, border=border)
+        subsampling=subsampling, border=border, fold=fold)
 
 
-def _design(theta, a, *, psf, native_shape, subsampling, border):
+def _design(theta, a, *, psf, native_shape, subsampling, border,
+            fold=True):
     """(nimage, ncoefficient, npixel) design: source then background bases."""
     _, jnp = _ensure_jax()
     sources = _sources(theta, a, psf=psf, native_shape=native_shape,
-                       subsampling=subsampling, border=border)
+                       subsampling=subsampling, border=border, fold=fold)
     nimage = sources.shape[0]
     npix = native_shape[0] * native_shape[1]
     bases = jnp.asarray(a["background_bases"])
@@ -487,7 +495,7 @@ def _extract_batch(theta, a, data, inverse_variance, *, psf, native_shape,
     values and their variances (diagonal of the inverse normal matrix)."""
     _, jnp = _ensure_jax()
     design = _design(theta, a, psf=psf, native_shape=native_shape,
-                     subsampling=subsampling, border=border)
+                     subsampling=subsampling, border=border, fold=False)
     nimage = design.shape[0]
     weight = inverse_variance.reshape(nimage, -1)
     data = data.reshape(nimage, -1)
