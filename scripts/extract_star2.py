@@ -84,6 +84,10 @@ if __name__ == "__main__":
     parser.add_option("--no-jax-wavelength-batching",
                       dest="jax_wavelength_batching", action="store_false",
                       help="Disable JAX wavelength batching")
+    parser.add_option("--fit-backend", dest="fit_backend",
+                      choices=("numpy", "jax"), default="numpy",
+                      help="Metaslice fit gradients/Hessians: numpy finite "
+                      "differences or exact JAX [%default]")
     parser.add_option("--filterVariance", dest="filter_variance",
                       action="store_true", help="Apply a filter in wavelength "
                       "to the variance estimate to avoid Poisson biases.",
@@ -183,7 +187,8 @@ if __name__ == "__main__":
             prior_scale=opts.usePriors,
             seeing_prior=opts.seeingPrior,
             accountant=accountant,
-            verbosity=opts.verbosity
+            verbosity=opts.verbosity,
+            fit_backend=opts.fit_backend,
         )
     except scene_model.SceneModelException as e:
         parser.error(str(e))

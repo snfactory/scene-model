@@ -1270,12 +1270,21 @@ class SnifsCubeFitter(object):
                  subsampling=config.default_subsampling,
                  border=config.default_border, least_squares=False,
                  filter_variance=False, prior_scale=0., seeing_prior=None,
-                 accountant=None, verbosity=0):
+                 accountant=None, verbosity=0, fit_backend='numpy'):
         """Initialize the fitter.
 
         path is the path to the fits cube that will be extracted.
+
+        fit_backend='jax' fits the 2D/3D metaslice models with exact JAX
+        gradients and computes their covariances from exact JAX Hessians
+        (see jax_fit); 'numpy' keeps the finite-difference reference path.
         """
+        from .fit import check_fit_backend
         self.verbosity = verbosity
+        self.fit_backend = check_fit_backend(fit_backend)
+        self.covariance_method = (
+            'jax' if fit_backend == 'jax' else config.default_covariance_method
+        )
 
         self._read_cube(path)
         self._setup_psf(psf, prior_scale=prior_scale,
@@ -1552,9 +1561,11 @@ class SnifsCubeFitter(object):
                     center_y=initial_position_y,
                 )
 
-                full_model.fit()
+                full_model.fit(fit_backend=self.fit_backend)
 
-                uncertainties = full_model.calculate_uncertainties()
+                uncertainties = full_model.calculate_uncertainties(
+                    method=self.covariance_method
+                )
 
                 if self.verbosity >= 2:
                     print("")
@@ -1793,12 +1804,14 @@ class SnifsCubeFitter(object):
         for key in self.global_fit_keys:
             fitter.add_global_fit_parameter(key)
 
-        fit_scene_model = fitter.fit()
+        fit_scene_model = fitter.fit(fit_backend=self.fit_backend)
 
         # Calculate covariance matrix
         print("  Calculating covariance...")
         try:
-            covariance_names, covariance = fitter.calculate_covariance()
+            covariance_names, covariance = fitter.calculate_covariance(
+                method=self.covariance_method
+            )
         except SceneModelException as e:
             # Failed to calculate the covariance. This can happen for many
             # reasons. Print out the model that we failed on to help figure out
@@ -2403,6 +2416,7 @@ class SnifsCubeFitter(object):
         header[p('BORD')] = (self.border, 'Model border')
 
         header[p('METH')] = (self.extraction_method, 'Extraction method')
+        header[p('FITBK')] = (self.fit_backend, 'Metaslice fit backend')
         if self.extraction_radius is not None:
             header[p('APRAD')] = (self.extraction_radius,
                                   'Aperture radius [" or sigma]')

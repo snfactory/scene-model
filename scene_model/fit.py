@@ -15,6 +15,13 @@ from .config import numpy as np
 if config.use_autograd:
     from autograd import grad, hessian
 
+def check_fit_backend(fit_backend):
+    """Validate a fit backend name ('numpy' or 'jax')."""
+    if fit_backend not in ('numpy', 'jax'):
+        raise SceneModelException("Unknown fit backend %r" % (fit_backend,))
+    return fit_backend
+
+
 def hessian_to_covariance(hessian):
     """Safely invert a Hessian matrix to get a covariance matrix.
 
@@ -697,7 +704,10 @@ class MultipleImageFitter():
         models = np.array(models)
         return models
 
-    def fit(self, do_analytic_coefficients=True, verbose=False, ftol=1e-10):
+    def fit(self, do_analytic_coefficients=True, verbose=False, ftol=1e-10,
+            fit_backend='numpy'):
+        """Fit all images; fit_backend='jax' supplies the exact gradient
+        (SNIFS Fourier/classic models only, see jax_fit)."""
         global_parameters, individual_parameters = \
             self._get_fit_parameters(do_analytic_coefficients)
 
@@ -724,11 +734,22 @@ class MultipleImageFitter():
 
             return chi_square
 
+        if check_fit_backend(fit_backend) == 'jax':
+            from .jax_fit import multiple_image_objective
+            objective = multiple_image_objective(
+                self, parameter_names,
+                analytic_coefficients=do_analytic_coefficients,
+            )
+            function, jac = objective.value_and_grad, True
+        else:
+            function = chi_square_flat
+            jac = grad(chi_square_flat) if config.use_autograd else None
+
         res = minimize(
-            chi_square_flat,
+            function,
             initial_values,
             bounds=bounds,
-            jac=grad(chi_square_flat) if config.use_autograd else None,
+            jac=jac,
             method='L-BFGS-B',
             options={'maxiter': 400, 'ftol': ftol},
         )
@@ -893,8 +914,16 @@ class MultipleImageFitter():
                 apply_priors=True,
             )
 
-        cov = calculate_covariance(chi_square_flat, method, parameter_names,
-                                   parameter_values, bounds, verbose=verbose)
+        if method == 'jax':
+            from .jax_fit import multiple_image_objective
+            objective = multiple_image_objective(
+                self, parameter_names, analytic_coefficients=False,
+            )
+            cov = hessian_to_covariance(objective.hessian(parameter_values))
+        else:
+            cov = calculate_covariance(chi_square_flat, method,
+                                       parameter_names, parameter_values,
+                                       bounds, verbose=verbose)
 
         # Rescale amplitude and background parameters.
         cov *= np.outer(scales, scales)

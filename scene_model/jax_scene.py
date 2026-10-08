@@ -342,12 +342,11 @@ def _ensure_jax():
     return jax, jnp
 
 
-def _classic_flux_impl(canonical_parameters, data, inverse_variance,
-                       wavelengths, adr_scale, pad_grid_x, pad_grid_y,
-                       pad_grid_kx, pad_grid_ky, pad_fft_shift,
-                       pad_ifft_shift, background_bases, profile_constants,
-                       *, subsampling, border):
-    """Evaluate the exact fixed classic variable-projection map in JAX."""
+def classic_source_pixels(canonical_parameters, wavelengths, adr_scale,
+                          pad_grid_x, pad_grid_y, pad_grid_kx, pad_grid_ky,
+                          pad_fft_shift, pad_ifft_shift, profile_constants,
+                          *, native_shape, subsampling, border):
+    """Unit-amplitude classic point-source images, one per wavelength."""
     _, jnp = _ensure_jax()
     (ref_center_x, ref_center_y, adr_delta, adr_theta,
      A0, A1, A2, ell, xy) = canonical_parameters
@@ -398,10 +397,13 @@ def _classic_flux_impl(canonical_parameters, data, inverse_variance,
     source_subpixels = jnp.real(jnp.fft.ifft2(
         source_fourier * pad_ifft_shift[jnp.newaxis, :, :], axes=(-2, -1)
     ))
+    return _bin_subpixels(source_subpixels, native_shape, subsampling, border)
 
-    nwave = data.shape[0]
-    native_x = data.shape[1]
-    native_y = data.shape[2]
+
+def _bin_subpixels(source_subpixels, native_shape, subsampling, border):
+    """Sum subpixels into native spaxels and drop the evaluation border."""
+    nwave = source_subpixels.shape[0]
+    native_x, native_y = native_shape
     expanded_x = native_x + 2 * border
     expanded_y = native_y + 2 * border
     source_pixels = source_subpixels.reshape(
@@ -409,7 +411,13 @@ def _classic_flux_impl(canonical_parameters, data, inverse_variance,
     ).sum(axis=(2, 4))
     if border:
         source_pixels = source_pixels[:, border:-border, border:-border]
+    return source_pixels
 
+
+def _projected_flux(source_pixels, data, inverse_variance, background_bases):
+    """Per-wavelength weighted least squares; returns the source coefficient."""
+    _, jnp = _ensure_jax()
+    nwave, native_x, native_y = data.shape
     source_basis = source_pixels.reshape(nwave, -1)
     fixed_background = jnp.broadcast_to(
         background_bases[jnp.newaxis, :, :, :],
@@ -428,6 +436,22 @@ def _classic_flux_impl(canonical_parameters, data, inverse_variance,
         "ncd,nd->nc", jnp.linalg.inv(normal), right_hand_side
     )
     return coefficients[:, 0]
+
+
+def _classic_flux_impl(canonical_parameters, data, inverse_variance,
+                       wavelengths, adr_scale, pad_grid_x, pad_grid_y,
+                       pad_grid_kx, pad_grid_ky, pad_fft_shift,
+                       pad_ifft_shift, background_bases, profile_constants,
+                       *, subsampling, border):
+    """Evaluate the exact fixed classic variable-projection map in JAX."""
+    source_pixels = classic_source_pixels(
+        canonical_parameters, wavelengths, adr_scale, pad_grid_x, pad_grid_y,
+        pad_grid_kx, pad_grid_ky, pad_fft_shift, pad_ifft_shift,
+        profile_constants, native_shape=data.shape[1:],
+        subsampling=subsampling, border=border,
+    )
+    return _projected_flux(source_pixels, data, inverse_variance,
+                           background_bases)
 
 
 @lru_cache(maxsize=16)
@@ -521,11 +545,11 @@ def classic_flux_jacobian(parameter_values, parameter_names, fixed):
     return jacobian
 
 
-def _fourier_flux_impl(canonical_parameters, data, inverse_variance,
-                       wavelengths, adr_scale, pad_grid_kx, pad_grid_ky,
-                       pad_ifft_shift, background_bases, profile_constants,
-                       *, subsampling, border):
-    """Evaluate the exact fixed Fourier variable-projection map in JAX."""
+def fourier_source_pixels(canonical_parameters, wavelengths, adr_scale,
+                          pad_grid_kx, pad_grid_ky, pad_ifft_shift,
+                          profile_constants, *, native_shape, subsampling,
+                          border):
+    """Unit-amplitude Fourier point-source images, one per wavelength."""
     _, jnp = _ensure_jax()
     (ref_center_x, ref_center_y, adr_delta, adr_theta,
      seeing_ref_power, seeing_ref_width,
@@ -583,36 +607,21 @@ def _fourier_flux_impl(canonical_parameters, data, inverse_variance,
     source_subpixels = jnp.real(jnp.fft.ifft2(
         source_fourier * pad_ifft_shift[jnp.newaxis, :, :], axes=(-2, -1)
     ))
+    return _bin_subpixels(source_subpixels, native_shape, subsampling, border)
 
-    nwave = data.shape[0]
-    native_x = data.shape[1]
-    native_y = data.shape[2]
-    expanded_x = native_x + 2 * border
-    expanded_y = native_y + 2 * border
-    source_pixels = source_subpixels.reshape(
-        nwave, expanded_x, subsampling, expanded_y, subsampling
-    ).sum(axis=(2, 4))
-    if border:
-        source_pixels = source_pixels[:, border:-border, border:-border]
 
-    source_basis = source_pixels.reshape(nwave, -1)
-    fixed_background = jnp.broadcast_to(
-        background_bases[jnp.newaxis, :, :, :],
-        (nwave,) + background_bases.shape,
-    ).reshape(nwave, background_bases.shape[0], native_x * native_y)
-    design = jnp.concatenate(
-        (source_basis[:, jnp.newaxis, :], fixed_background), axis=1
-    ).transpose(0, 2, 1)
-    weight = inverse_variance.reshape(nwave, -1)
-    fixed_data = data.reshape(nwave, -1)
-    normal = jnp.einsum("npc,np,npd->ncd", design, weight, design)
-    right_hand_side = jnp.einsum(
-        "npc,np,np->nc", design, weight, fixed_data
+def _fourier_flux_impl(canonical_parameters, data, inverse_variance,
+                       wavelengths, adr_scale, pad_grid_kx, pad_grid_ky,
+                       pad_ifft_shift, background_bases, profile_constants,
+                       *, subsampling, border):
+    """Evaluate the exact fixed Fourier variable-projection map in JAX."""
+    source_pixels = fourier_source_pixels(
+        canonical_parameters, wavelengths, adr_scale, pad_grid_kx,
+        pad_grid_ky, pad_ifft_shift, profile_constants,
+        native_shape=data.shape[1:], subsampling=subsampling, border=border,
     )
-    coefficients = jnp.einsum(
-        "ncd,nd->nc", jnp.linalg.inv(normal), right_hand_side
-    )
-    return coefficients[:, 0]
+    return _projected_flux(source_pixels, data, inverse_variance,
+                           background_bases)
 
 
 @lru_cache(maxsize=16)

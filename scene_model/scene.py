@@ -851,7 +851,14 @@ class SceneModel(object):
 
         return parameters
 
-    def fit(self, do_analytic_coefficients=True, verbose=False, ftol=1e-10):
+    def fit(self, do_analytic_coefficients=True, verbose=False, ftol=1e-10,
+            fit_backend='numpy'):
+        """Fit the model with L-BFGS-B.
+
+        fit_backend='jax' supplies the exact chi-square gradient from
+        jax_fit (SNIFS Fourier/classic models only); 'numpy' uses SciPy's
+        finite differences (or autograd if config.use_autograd).
+        """
         fit_parameters = self._get_fit_parameters(do_analytic_coefficients)
 
         parameter_names = list(fit_parameters.keys())
@@ -873,11 +880,22 @@ class SceneModel(object):
                 apply_priors=apply_priors,
             )
 
+        if fit.check_fit_backend(fit_backend) == 'jax':
+            from .jax_fit import scene_model_objective
+            objective = scene_model_objective(
+                self, parameter_names,
+                analytic_coefficients=do_analytic_coefficients,
+            )
+            function, jac = objective.value_and_grad, True
+        else:
+            function = chi_square_flat
+            jac = grad(chi_square_flat) if config.use_autograd else None
+
         res = minimize(
-            chi_square_flat,
+            function,
             initial_values,
             bounds=bounds,
-            jac=grad(chi_square_flat) if config.use_autograd else None,
+            jac=jac,
             method='L-BFGS-B',
             options={'maxiter': 400, 'ftol': ftol},
         )
@@ -934,9 +952,16 @@ class SceneModel(object):
                 apply_fit_scale=True, apply_priors=True
             )
 
-        cov = fit.calculate_covariance(evaluate_chi_square, method,
-                                       parameter_names, values, bounds,
-                                       verbose=verbose)
+        if method == 'jax':
+            from .jax_fit import scene_model_objective
+            objective = scene_model_objective(
+                self, parameter_names, analytic_coefficients=False,
+            )
+            cov = fit.hessian_to_covariance(objective.hessian(values))
+        else:
+            cov = fit.calculate_covariance(evaluate_chi_square, method,
+                                           parameter_names, values, bounds,
+                                           verbose=verbose)
 
         # Rescale parameters.
         cov *= np.outer(scales, scales)
@@ -951,7 +976,8 @@ class SceneModel(object):
         """
         fit._plot_correlation(self, names, covariance, **kwargs)
 
-    def calculate_uncertainties(self, names=None, covariance=None):
+    def calculate_uncertainties(self, names=None, covariance=None,
+                                method=config.default_covariance_method):
         """Estimate the uncertainties on all fit parameters.
 
         This is done by calculating the full covariance matrix and returning a
@@ -971,7 +997,7 @@ class SceneModel(object):
                     "previously-calculated covariance matrix!"
                 )
         else:
-            names, covariance = self.calculate_covariance()
+            names, covariance = self.calculate_covariance(method=method)
 
         uncertainties = np.sqrt(np.diag(covariance))
 
