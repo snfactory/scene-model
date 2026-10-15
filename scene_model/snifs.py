@@ -22,9 +22,11 @@ from .models import GaussianMoffatPsfElement, \
     GaussianSceneModel
 from .fit import MultipleImageFitter
 from .prior import MultivariateGaussianPrior
-from .covariance import assemble_flux_covariance, factor_covariance, \
-    finite_difference_jacobian, fixed_extraction_map, JacobianDiagnostics, \
-    select_marginal_covariance
+from .covariance import assemble_flux_covariance, check_baseline_parity, \
+    factor_covariance, finite_difference_jacobian, fixed_extraction_map, \
+    JacobianDiagnostics, select_marginal_covariance
+from .scene_sidecar import build_scene_sidecar, write_scene_sidecar, \
+    sidecar_path as scene_sidecar_path
 
 # If we are using autograd, then we need to use a special version of numpy.
 from .config import numpy as np
@@ -2218,6 +2220,8 @@ class SnifsCubeFitter(object):
                     "Covariance evaluation changed accepted native flux"
                 )
 
+            jacobian_model = None
+            baseline_parity = None
             if jacobian_backend == 'finite-difference':
                 jacobian, derivative_diagnostics = finite_difference_jacobian(
                     evaluate_flux, self.fit_global_parameter_info,
@@ -2236,9 +2240,17 @@ class SnifsCubeFitter(object):
                     batched_flux_jacobian,
                     classic_flux,
                     classic_flux_jacobian,
+                    flux_and_jacobian_folded,
                     fourier_flux,
                     fourier_flux_jacobian,
                 )
+
+                # With the JAX fit backend, differentiate the folded model
+                # (Fourier-space subpixel fold, one JVP direction at a
+                # time; bounded memory at production subsampling).  The
+                # NumPy-fit path keeps the unfolded jacfwd oracle.
+                folded = getattr(self, 'fit_backend', 'numpy') == 'jax'
+                jacobian_model = 'folded' if folded else 'unfolded'
 
                 if jax_wavelength_batch not in (
                         None, PRODUCTION_WAVELENGTH_BATCH):
@@ -2280,7 +2292,12 @@ class SnifsCubeFitter(object):
                         adr_scale, evaluation_model.grid_info,
                         background_bases, self.header['EFFTIME'],
                     )
-                    if jax_wavelength_batch is None:
+                    if jax_wavelength_batch is None and folded:
+                        jax_flux, jacobian = flux_and_jacobian_folded(
+                            baseline_values, parameter_names, fixed_jax,
+                            profile='classic',
+                        )
+                    elif jax_wavelength_batch is None:
                         jax_flux = classic_flux(
                             baseline_values, parameter_names, fixed_jax
                         )
@@ -2292,6 +2309,7 @@ class SnifsCubeFitter(object):
                             baseline_values, parameter_names, fixed_jax,
                             profile='classic',
                             wavelength_batch=jax_wavelength_batch,
+                            folded=folded,
                         )
                 elif self.psf == 'fourier':
                     if set(parameter_names) != set(FOURIER_PARAMETER_NAMES):
@@ -2308,7 +2326,12 @@ class SnifsCubeFitter(object):
                         adr_scale, evaluation_model.grid_info,
                         background_bases, profile_constants,
                     )
-                    if jax_wavelength_batch is None:
+                    if jax_wavelength_batch is None and folded:
+                        jax_flux, jacobian = flux_and_jacobian_folded(
+                            baseline_values, parameter_names, fixed_jax,
+                            profile='fourier',
+                        )
+                    elif jax_wavelength_batch is None:
                         jax_flux = fourier_flux(
                             baseline_values, parameter_names, fixed_jax
                         )
@@ -2320,24 +2343,27 @@ class SnifsCubeFitter(object):
                             baseline_values, parameter_names, fixed_jax,
                             profile='fourier',
                             wavelength_batch=jax_wavelength_batch,
+                            folded=folded,
                         )
                 else:
                     raise SceneModelException(
                         "JAX covariance does not support PSF %s" % self.psf
                     )
-                if jax_flux.shape != expected_flux.shape or not np.allclose(
-                        jax_flux, expected_flux, rtol=1e-12, atol=0.0):
-                    difference = (
-                        np.max(np.abs(jax_flux - expected_flux))
-                        if jax_flux.shape == expected_flux.shape else np.inf
-                    )
-                    raise SceneModelException(
-                        "JAX fixed-map baseline failed accepted NumPy parity "
-                        "(maximum absolute difference=%g)" % difference
-                    )
+                # The accepted flux (expected_flux) is the NumPy
+                # extraction: covariance extractions always run
+                # extraction_backend 'numpy'.  The JAX surrogate agrees
+                # with it to FFT-schedule roundoff; raises beyond
+                # relative 1e-9 or 1e-6 sigma, whichever is looser.
+                baseline_parity = check_baseline_parity(
+                    jax_flux, expected_flux,
+                    np.asarray(extraction['amplitude_variance']),
+                )
                 derivative_diagnostics = JacobianDiagnostics(
                     steps=tuple(), stability=tuple(), stencils=tuple(),
-                    backend='jax', provenance=jax_runtime_provenance(),
+                    backend='jax',
+                    provenance=jax_runtime_provenance() + (
+                        ('jacobian_model', jacobian_model),
+                    ),
                 )
             flux_covariance, propagated_factor = assemble_flux_covariance(
                 conditional_variance, jacobian, covariance_factor
@@ -2365,6 +2391,22 @@ class SnifsCubeFitter(object):
                     jax_wavelength_batch if jacobian_backend == 'jax'
                     else None
                 ),
+                # 'folded' | 'unfolded' JAX forward model; None for
+                # finite differences of the NumPy extraction.
+                'jacobian_model': jacobian_model,
+                # JAX baseline vs accepted NumPy flux (check_baseline_parity
+                # maxima); None for finite differences, whose baseline is
+                # required to match exactly.
+                'baseline_parity': baseline_parity,
+                # Separately addressable covariance parts and the fixed
+                # inputs the native estimator consumed (read-only copies on
+                # the cube_to_arrays grid; NaN where masked).  The scene
+                # covariance sidecar (scene_sidecar.py) is built from these.
+                'conditional_variance': np.array(conditional_variance,
+                                                 dtype=float, copy=True),
+                'covariance_factor': covariance_factor,
+                'fixed_data': fixed_data,
+                'fixed_variance': fixed_variance,
             }
         self.point_source_spectrum = point_source_spectrum
 
@@ -2531,6 +2573,14 @@ class SnifsCubeFitter(object):
                     'COVDER %s: h=%.8g stability=%.5g stencil=%s' %
                     (parameter.name, step, stability, stencil)
                 )
+            # Build (and check H @ data == flux) before touching any
+            # destination; the sidecar is written after the spectrum exists
+            # so it can record the final file's SHA-256.
+            scene_sidecar_payload = build_scene_sidecar(self)
+            header['COVSIDE'] = (
+                os.path.basename(scene_sidecar_path(output_path)),
+                'Scene covariance sidecar',
+            )
 
         outputs = [(self.point_source_spectrum, output_path, header,
                     'point-source')]
@@ -2561,6 +2611,16 @@ class SnifsCubeFitter(object):
                 for temporary_path, path in staged:
                     if os.path.exists(temporary_path):
                         os.unlink(temporary_path)
+            try:
+                written = write_scene_sidecar(output_path,
+                                              scene_sidecar_payload)
+            except BaseException:
+                # Never leave a spectrum whose COVSIDE names a sidecar that
+                # does not exist.
+                if os.path.exists(output_path):
+                    os.unlink(output_path)
+                raise
+            print("  Saved scene covariance sidecar to '%s'" % written)
         else:
             for spectrum, path, output_header, label in outputs:
                 print("  Saving output %s spectrum to '%s'" % (label, path))

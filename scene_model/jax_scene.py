@@ -500,13 +500,13 @@ def _classic_flux_impl(canonical_parameters, data, inverse_variance,
                        wavelengths, adr_scale, pad_grid_x, pad_grid_y,
                        pad_grid_kx, pad_grid_ky, pad_fft_shift,
                        pad_ifft_shift, background_bases, profile_constants,
-                       *, subsampling, border):
+                       *, subsampling, border, fold=False):
     """Evaluate the exact fixed classic variable-projection map in JAX."""
     source_pixels = classic_source_pixels(
         canonical_parameters, wavelengths, adr_scale, pad_grid_x, pad_grid_y,
         pad_grid_kx, pad_grid_ky, pad_fft_shift, pad_ifft_shift,
         profile_constants, native_shape=data.shape[1:],
-        subsampling=subsampling, border=border,
+        subsampling=subsampling, border=border, fold=fold,
     )
     return _projected_flux(source_pixels, data, inverse_variance,
                            background_bases)
@@ -659,12 +659,13 @@ def fourier_source_pixels(canonical_parameters, wavelengths, adr_scale,
 def _fourier_flux_impl(canonical_parameters, data, inverse_variance,
                        wavelengths, adr_scale, pad_grid_kx, pad_grid_ky,
                        pad_ifft_shift, background_bases, profile_constants,
-                       *, subsampling, border):
+                       *, subsampling, border, fold=False):
     """Evaluate the exact fixed Fourier variable-projection map in JAX."""
     source_pixels = fourier_source_pixels(
         canonical_parameters, wavelengths, adr_scale, pad_grid_kx,
         pad_grid_ky, pad_ifft_shift, profile_constants,
         native_shape=data.shape[1:], subsampling=subsampling, border=border,
+        fold=fold,
     )
     return _projected_flux(source_pixels, data, inverse_variance,
                            background_bases)
@@ -771,17 +772,126 @@ def _fixed_wavelength_slice(fixed, start, stop):
     )
 
 
+def _folded_flux_and_jacobian(flux_impl, subsampling, border):
+    """jit(parameters, *arrays) -> (flux, Jacobian) of the folded model.
+
+    The forward model aliases the subsampled spectrum onto the native grid
+    before a native-size inverse FFT (``_spectrum_to_pixels(fold=True)``).
+    The Jacobian columns are forward-mode JVPs taken one parameter direction
+    at a time under ``lax.map`` (the pattern of ``jax_fit._hessian``), so
+    peak tangent storage is one direction instead of ``jacfwd``'s nparam
+    directions at once.  Flux and Jacobian come from one compiled model.
+    """
+    jax, jnp = _ensure_jax()
+
+    def flux_and_jacobian(parameters, *arrays):
+        def flux(theta):
+            return flux_impl(theta, *arrays, subsampling=subsampling,
+                             border=border, fold=True)
+
+        directions = jnp.eye(parameters.shape[0], dtype=parameters.dtype)
+        columns = jax.lax.map(
+            lambda direction: jax.jvp(flux, (parameters,), (direction,))[1],
+            directions,
+        )
+        return flux(parameters), columns.T
+
+    return jax.jit(flux_and_jacobian)
+
+
+@lru_cache(maxsize=16)
+def _compiled_classic_flux_and_jacobian_folded(subsampling, border):
+    return _folded_flux_and_jacobian(_classic_flux_impl, subsampling, border)
+
+
+@lru_cache(maxsize=16)
+def _compiled_fourier_flux_and_jacobian_folded(subsampling, border):
+    return _folded_flux_and_jacobian(_fourier_flux_impl, subsampling, border)
+
+
+def flux_and_jacobian_folded(parameter_values, parameter_names, fixed,
+                             *, profile):
+    """Folded-model flux and Jacobian in caller-declared name order.
+
+    Same map as ``classic_flux``/``fourier_flux`` and their ``jacfwd``
+    Jacobians (which stay the unfolded oracle), evaluated through the
+    Fourier-space subpixel fold and one JVP direction at a time.
+    """
+    if profile == "classic":
+        canonical_names = CLASSIC_PARAMETER_NAMES
+        canonical, canonical_indices = _canonical_parameters(
+            parameter_values, parameter_names
+        )
+        arguments = _fixed_arguments(fixed)
+        compiled = _compiled_classic_flux_and_jacobian_folded
+        label = "Classic"
+    elif profile == "fourier":
+        canonical_names = FOURIER_PARAMETER_NAMES
+        canonical, canonical_indices = _canonical_fourier_parameters(
+            parameter_values, parameter_names
+        )
+        arguments = _fourier_fixed_arguments(fixed)
+        compiled = _compiled_fourier_flux_and_jacobian_folded
+        label = "Fourier"
+    else:
+        raise SceneModelException("Unknown JAX scene profile %s" % profile)
+
+    flux, canonical_jacobian = compiled(fixed.subsampling, fixed.border)(
+        canonical, *arguments
+    )
+    flux = np.asarray(flux, dtype=np.float64)
+    canonical_jacobian = np.asarray(canonical_jacobian, dtype=np.float64)
+    nwave = len(fixed.wavelengths)
+    if flux.shape != (nwave,) or not np.all(np.isfinite(flux)):
+        raise SceneModelException("%s folded JAX flux is invalid" % label)
+    if canonical_jacobian.shape != (nwave, len(canonical_names)) or \
+            not np.all(np.isfinite(canonical_jacobian)):
+        raise SceneModelException(
+            "%s folded JAX flux Jacobian is invalid" % label
+        )
+    jacobian = np.empty_like(canonical_jacobian)
+    jacobian[:, canonical_indices] = canonical_jacobian
+    return flux, jacobian
+
+
 def batched_flux_jacobian(parameter_values, parameter_names, fixed,
                           *, profile,
-                          wavelength_batch=PRODUCTION_WAVELENGTH_BATCH):
+                          wavelength_batch=PRODUCTION_WAVELENGTH_BATCH,
+                          folded=False):
     """Evaluate production flux and its Jacobian in bounded wavelength batches.
 
     Native coefficient solves are independent between wavelengths.  Batching
     therefore changes only peak JAX tangent storage, not the extraction map.
+
+    folded=False: unfolded model, ``jacfwd`` (the validated oracle path).
+    folded=True: ``flux_and_jacobian_folded`` per batch (Fourier-space
+    subpixel fold, one JVP direction at a time); equal to the unfolded map
+    up to rounding.
     """
     wavelength_batch = int(wavelength_batch)
     if wavelength_batch < 1:
         raise SceneModelException("JAX wavelength batch must be positive")
+    if folded:
+        if profile not in ("classic", "fourier"):
+            raise SceneModelException(
+                "Unknown JAX scene profile %s" % profile
+            )
+        flux_parts = []
+        jacobian_parts = []
+        for start in range(0, len(fixed.wavelengths), wavelength_batch):
+            stop = min(start + wavelength_batch, len(fixed.wavelengths))
+            batch = _fixed_wavelength_slice(fixed, start, stop)
+            flux, jacobian = flux_and_jacobian_folded(
+                parameter_values, parameter_names, batch, profile=profile
+            )
+            flux_parts.append(flux)
+            jacobian_parts.append(jacobian)
+        if not flux_parts:
+            raise SceneModelException(
+                "JAX scene extraction has no wavelengths"
+            )
+        return (np.concatenate(flux_parts),
+                np.concatenate(jacobian_parts, axis=0))
     if profile == "classic":
         flux_function = classic_flux
         jacobian_function = classic_flux_jacobian

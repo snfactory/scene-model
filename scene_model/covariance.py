@@ -209,6 +209,74 @@ def finite_difference_jacobian(evaluate_flux, parameters, covariance,
     )
 
 
+BASELINE_PARITY_RTOL = 1e-9
+BASELINE_PARITY_SIGMA_FRACTION = 1e-6
+
+
+def check_baseline_parity(surrogate_flux, accepted_flux, accepted_variance,
+                          *, rtol=BASELINE_PARITY_RTOL,
+                          sigma_fraction=BASELINE_PARITY_SIGMA_FRACTION):
+    """Gate a JAX fixed-map baseline flux against the accepted NumPy flux.
+
+    The JAX surrogate and the NumPy extraction evaluate the same map with
+    different FFT schedules (and, for the folded model, a different but
+    exact subpixel summation), so they agree only to roundoff.  Per
+    wavelength the allowed absolute difference is the looser of
+    ``rtol * |accepted|`` and ``sigma_fraction * sqrt(accepted_variance)``.
+    Returns the achieved maxima; raises SceneModelException if any
+    wavelength exceeds its allowance.
+    """
+    surrogate = np.asarray(surrogate_flux, dtype=np.float64)
+    accepted = np.asarray(accepted_flux, dtype=np.float64)
+    variance = np.asarray(accepted_variance, dtype=np.float64)
+    if surrogate.shape != accepted.shape or variance.shape != accepted.shape \
+            or accepted.ndim != 1:
+        raise SceneModelException(
+            "JAX fixed-map baseline failed accepted NumPy parity "
+            "(flux axes differ)"
+        )
+    if not np.all(np.isfinite(surrogate)) or \
+            not np.all(np.isfinite(accepted)):
+        raise SceneModelException(
+            "JAX fixed-map baseline failed accepted NumPy parity "
+            "(non-finite flux)"
+        )
+    if not np.all(np.isfinite(variance)) or np.any(variance < 0):
+        raise SceneModelException(
+            "Accepted variances are invalid for the baseline parity gate"
+        )
+    difference = np.abs(surrogate - accepted)
+    sigma = np.sqrt(variance)
+    allowed = np.maximum(rtol * np.abs(accepted), sigma_fraction * sigma)
+
+    def _scaled(scale):
+        result = np.zeros_like(difference)
+        nonzero = scale > 0
+        result[nonzero] = difference[nonzero] / scale[nonzero]
+        result[~nonzero & (difference > 0)] = np.inf
+        return result
+
+    relative = _scaled(np.abs(accepted))
+    sigma_scaled = _scaled(sigma)
+    diagnostics = {
+        'rtol': float(rtol),
+        'sigma_fraction': float(sigma_fraction),
+        'max_absolute': float(difference.max()) if difference.size else 0.0,
+        'max_relative': float(relative.max()) if relative.size else 0.0,
+        'max_sigma_scaled': (float(sigma_scaled.max())
+                             if sigma_scaled.size else 0.0),
+    }
+    if np.any(difference > allowed):
+        raise SceneModelException(
+            "JAX fixed-map baseline failed accepted NumPy parity "
+            "(maximum absolute difference=%g, maximum relative=%g, "
+            "maximum sigma-scaled=%g; allowed: relative %g or %g sigma)"
+            % (diagnostics['max_absolute'], diagnostics['max_relative'],
+               diagnostics['max_sigma_scaled'], rtol, sigma_fraction)
+        )
+    return diagnostics
+
+
 def assemble_flux_covariance(conditional_variance, jacobian, factor):
     conditional_variance = np.asarray(conditional_variance, dtype=float)
     jacobian = np.asarray(jacobian, dtype=float)
