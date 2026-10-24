@@ -7,11 +7,12 @@ global-parameter Jacobian without tracing the mutable model element graph.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, fields, replace
+from dataclasses import dataclass, field, fields, replace
 from functools import lru_cache
 
 import numpy as np
 
+from .scala_mask import APERTURE_RADIUS, circular_aperture_otf
 from .utils import SceneModelException
 
 
@@ -50,6 +51,56 @@ FOURIER_PROFILE_NAMES = (
 REFERENCE_WAVELENGTH = 5000.0
 NATIVE_SPAXELS = 225
 PRODUCTION_WAVELENGTH_BATCH = 128
+
+#: No SCALA mask: the Gaussian instrumental core of FOURIER_PROFILE_NAMES.
+NO_MASK_VECTORS = np.zeros((0, 2), dtype=np.float64)
+
+
+def fourier_profile_constants(parameters, inst_core="gaussian"):
+    """FOURIER_PROFILE_NAMES values of a Fourier scene model, in order.
+
+    With ``inst_core='scala_mask'`` the model has no Gaussian-core parameters
+    (the mask OTF replaces that factor, see ``fourier_source_pixels``); the
+    three ``inst_core_*`` slots are then 0 and unused.
+    """
+    values = []
+    for name in FOURIER_PROFILE_NAMES:
+        if inst_core == "scala_mask" and name.startswith("inst_core_"):
+            values.append(0.0)
+        else:
+            values.append(float(parameters[name]))
+    return np.asarray(values, dtype=np.float64)
+
+
+def fourier_mask_arrays(scene_model):
+    """(mask base vectors (n, 2), aperture radius) of a scene model.
+
+    ``n == 0`` (``NO_MASK_VECTORS``) means the Gaussian instrumental core.
+    """
+    if getattr(scene_model, "inst_core", "gaussian") == "scala_mask":
+        element = scene_model.inst_core_element
+        return (np.asarray(element.base_vectors, dtype=np.float64),
+                float(element.radius))
+    return NO_MASK_VECTORS, APERTURE_RADIUS
+
+
+def scala_mask_core(wavelengths, pad_grid_kx, pad_grid_ky, mask_vectors,
+                    mask_radius, xp):
+    """SCALA mask OTF per wavelength: (nwave, nx, ny).
+
+    Same function as ``ScalaMaskPsfElement._evaluate_fourier``
+    (``scala_mask.scala_mask_otf``) with the wavelength axis broadcast.
+    """
+    wave = xp.asarray(wavelengths)[:, None, None]
+    kx = xp.asarray(pad_grid_kx)[None, :, :]
+    ky = xp.asarray(pad_grid_ky)[None, :, :]
+    core = None
+    for index in range(mask_vectors.shape[0]):
+        term = circular_aperture_otf(kx, ky, mask_vectors[index, 0],
+                                     mask_vectors[index, 1], mask_radius,
+                                     wave, xp=xp)
+        core = term if core is None else core + term
+    return core
 
 
 def _readonly_array(value, dtype=np.float64):
@@ -152,12 +203,16 @@ class FourierFixedArrays:
     profile_constants: np.ndarray
     subsampling: int
     border: int
+    # SCALA mask instrumental core; (0, 2) selects the Gaussian core.
+    mask_vectors: np.ndarray = field(
+        default_factory=lambda: NO_MASK_VECTORS.copy())
+    mask_radius: float = APERTURE_RADIUS
 
     def __post_init__(self):
         real_fields = (
             "data", "inverse_variance", "wavelengths", "adr_scale",
             "pad_grid_kx", "pad_grid_ky", "background_bases",
-            "profile_constants",
+            "profile_constants", "mask_vectors",
         )
         for name in real_fields:
             object.__setattr__(self, name, _readonly_array(getattr(self, name)))
@@ -167,7 +222,13 @@ class FourierFixedArrays:
         )
         object.__setattr__(self, "subsampling", int(self.subsampling))
         object.__setattr__(self, "border", int(self.border))
+        object.__setattr__(self, "mask_radius", float(self.mask_radius))
 
+        if self.mask_vectors.ndim != 2 or self.mask_vectors.shape[1] != 2:
+            raise SceneModelException(
+                "Fourier mask base vectors must have shape (n, 2)")
+        if not self.mask_radius > 0:
+            raise SceneModelException("Fourier mask radius must be positive")
         if self.data.ndim != 3 or self.data.shape != self.inverse_variance.shape:
             raise SceneModelException("Fourier fixed data axes are inconsistent")
         nwave, native_x, native_y = self.data.shape
@@ -284,8 +345,15 @@ def build_classic_fixed_arrays(data, variance, wavelengths, adr_scale,
 
 def build_fourier_fixed_arrays(data, variance, wavelengths, adr_scale,
                                grid_info, background_bases,
-                               profile_constants):
-    """Export fixed Fourier inputs, including accepted empirical constants."""
+                               profile_constants, mask_vectors=None,
+                               mask_radius=APERTURE_RADIUS):
+    """Export fixed Fourier inputs, including accepted empirical constants.
+
+    ``mask_vectors`` (n, 2) selects the SCALA mask instrumental core
+    (``fourier_mask_arrays``); None or (0, 2) keeps the Gaussian core.
+    """
+    if mask_vectors is None:
+        mask_vectors = NO_MASK_VECTORS
     data = np.asarray(data, dtype=np.float64)
     variance = np.asarray(variance, dtype=np.float64)
     if data.shape != variance.shape or data.ndim != 3:
@@ -329,6 +397,8 @@ def build_fourier_fixed_arrays(data, variance, wavelengths, adr_scale,
         profile_constants=profile_constants,
         subsampling=grid_info["subsampling"],
         border=grid_info["border"],
+        mask_vectors=mask_vectors,
+        mask_radius=mask_radius,
     )
 
 
@@ -606,21 +676,34 @@ def classic_flux_jacobian(parameter_values, parameter_names, fixed):
 def fourier_source_pixels(canonical_parameters, wavelengths, adr_scale,
                           pad_grid_kx, pad_grid_ky, pad_ifft_shift,
                           profile_constants, *, native_shape, subsampling,
-                          border, fold=False):
-    """Unit-amplitude Fourier point-source images, one per wavelength."""
+                          border, fold=False, mask_vectors=None,
+                          mask_radius=APERTURE_RADIUS):
+    """Unit-amplitude Fourier point-source images, one per wavelength.
+
+    ``mask_vectors`` with ``n > 0`` rows replaces the Gaussian instrumental
+    core by the SCALA mask OTF (``scala_mask_core``); its shape is static
+    under ``jit``, so the choice is made at trace time.
+    """
     _, jnp = _ensure_jax()
     (ref_center_x, ref_center_y, adr_delta, adr_theta,
      seeing_ref_power, seeing_ref_width,
      ellipticity_x, ellipticity_y) = canonical_parameters
     (inst_core_sigma_x, inst_core_sigma_y, inst_core_rho,
      inst_wings_power, inst_wings_width, seeing_power) = profile_constants
+    use_mask = mask_vectors is not None and mask_vectors.shape[0] > 0
 
-    instrumental_core = jnp.exp(-0.5 * (
-        pad_grid_kx**2 * inst_core_sigma_x**2
-        + pad_grid_ky**2 * inst_core_sigma_y**2
-        + 2.0 * pad_grid_kx * pad_grid_ky * inst_core_rho
-        * inst_core_sigma_x * inst_core_sigma_y
-    ))
+    if use_mask:
+        # (nwave, nx, ny): chromatic, no fit parameters
+        instrumental_core = scala_mask_core(
+            wavelengths, pad_grid_kx, pad_grid_ky, mask_vectors, mask_radius,
+            jnp)
+    else:
+        instrumental_core = jnp.exp(-0.5 * (
+            pad_grid_kx**2 * inst_core_sigma_x**2
+            + pad_grid_ky**2 * inst_core_sigma_y**2
+            + 2.0 * pad_grid_kx * pad_grid_ky * inst_core_rho
+            * inst_core_sigma_x * inst_core_sigma_y
+        ))
     radial_frequency = jnp.sqrt(pad_grid_kx**2 + pad_grid_ky**2)
     instrumental_wings = jnp.exp(
         -inst_wings_width**inst_wings_power
@@ -649,9 +732,13 @@ def fourier_source_pixels(canonical_parameters, wavelengths, adr_scale,
         jnp.sinc(pad_grid_kx / jnp.pi / 2.0 / subsampling)
         * jnp.sinc(pad_grid_ky / jnp.pi / 2.0 / subsampling)
     )
-    static = (instrumental_core * instrumental_wings * tracking
-              * fourier_pixel * pad_ifft_shift)
-    source_fourier = phase * seeing * static[jnp.newaxis, :, :]
+    static = instrumental_wings * tracking * fourier_pixel * pad_ifft_shift
+    if use_mask:
+        source_fourier = (phase * seeing * instrumental_core
+                          * static[jnp.newaxis, :, :])
+    else:
+        source_fourier = phase * seeing * (
+            instrumental_core * static)[jnp.newaxis, :, :]
     return _spectrum_to_pixels(source_fourier, native_shape, subsampling,
                                border, fold)
 
@@ -659,13 +746,14 @@ def fourier_source_pixels(canonical_parameters, wavelengths, adr_scale,
 def _fourier_flux_impl(canonical_parameters, data, inverse_variance,
                        wavelengths, adr_scale, pad_grid_kx, pad_grid_ky,
                        pad_ifft_shift, background_bases, profile_constants,
+                       mask_vectors=None, mask_radius=APERTURE_RADIUS,
                        *, subsampling, border, fold=False):
     """Evaluate the exact fixed Fourier variable-projection map in JAX."""
     source_pixels = fourier_source_pixels(
         canonical_parameters, wavelengths, adr_scale, pad_grid_kx,
         pad_grid_ky, pad_ifft_shift, profile_constants,
         native_shape=data.shape[1:], subsampling=subsampling, border=border,
-        fold=fold,
+        fold=fold, mask_vectors=mask_vectors, mask_radius=mask_radius,
     )
     return _projected_flux(source_pixels, data, inverse_variance,
                            background_bases)
@@ -726,6 +814,8 @@ def _fourier_fixed_arguments(fixed):
         fixed.pad_ifft_shift,
         fixed.background_bases,
         fixed.profile_constants,
+        fixed.mask_vectors,
+        np.asarray(fixed.mask_radius, dtype=np.float64),
     )
 
 

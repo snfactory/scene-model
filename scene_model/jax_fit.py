@@ -28,12 +28,13 @@ import numpy as np
 from .jax_scene import (
     CLASSIC_PARAMETER_NAMES,
     FOURIER_PARAMETER_NAMES,
-    FOURIER_PROFILE_NAMES,
     REFERENCE_WAVELENGTH,
     _ensure_jax,
     build_polynomial_background_bases,
     check_separable_grid,
     classic_source_pixels,
+    fourier_mask_arrays,
+    fourier_profile_constants,
     fourier_source_pixels,
 )
 from .utils import SceneModelException
@@ -97,9 +98,9 @@ def _model_constants(scene_model, psf):
     grid = scene_model.grid_info
     check_separable_grid(grid["pad_grid_kx"], grid["pad_grid_ky"])
     if psf == "fourier":
-        parameters = scene_model.parameters
-        constants = np.asarray(
-            [float(parameters[name]) for name in FOURIER_PROFILE_NAMES])
+        constants = fourier_profile_constants(
+            scene_model.parameters,
+            getattr(scene_model, "inst_core", "gaussian"))
         grids = (np.asarray(grid["pad_grid_kx"], float),
                  np.asarray(grid["pad_grid_ky"], float),
                  np.asarray(grid["pad_ifft_shift"], complex))
@@ -162,11 +163,13 @@ class SceneObjective:
         self.psf = _psf_kind(model0)
         self.wavelength_dependence = bool(model0.wavelength_dependence)
         degree, coefficient_names = _background_degree(model0)
+        inst_core = getattr(model0, "inst_core", "gaussian")
         for model in scene_models[1:]:
             if _psf_kind(model) != self.psf or \
                     bool(model.wavelength_dependence) != \
                     self.wavelength_dependence or \
-                    _background_degree(model)[0] != degree:
+                    _background_degree(model)[0] != degree or \
+                    getattr(model, "inst_core", "gaussian") != inst_core:
                 raise SceneModelException("Inconsistent scene models")
         self.analytic = bool(analytic_coefficients)
         nimage = len(scene_models)
@@ -258,6 +261,8 @@ class SceneObjective:
 
         self.profile_constants, self.grids = _model_constants(model0,
                                                               self.psf)
+        # SCALA mask instrumental core (Fourier only; (0, 2) = Gaussian)
+        self.mask_vectors, self.mask_radius = fourier_mask_arrays(model0)
 
         # Priors: (scale, canonical indices or flat slots, centre, inverse cov)
         self.priors = []
@@ -299,6 +304,8 @@ class SceneObjective:
             wavelengths=self.wavelengths, adr_scale=self.adr_scale,
             background_bases=self.background_bases,
             profile_constants=self.profile_constants, grids=self.grids,
+            mask_vectors=self.mask_vectors,
+            mask_radius=np.asarray(self.mask_radius, dtype=np.float64),
             priors=tuple(self.priors),
         )
 
@@ -336,7 +343,8 @@ def _sources(theta, a, *, psf, native_shape, subsampling, border,
         return fourier_source_pixels(
             theta, a["wavelengths"], a["adr_scale"], *a["grids"],
             a["profile_constants"], native_shape=native_shape,
-            subsampling=subsampling, border=border, fold=fold)
+            subsampling=subsampling, border=border, fold=fold,
+            mask_vectors=a["mask_vectors"], mask_radius=a["mask_radius"])
     return classic_source_pixels(
         theta, a["wavelengths"], a["adr_scale"], *a["grids"],
         a["profile_constants"], native_shape=native_shape,
@@ -560,6 +568,7 @@ def extract_psf(scene_model, images, variances, wavelengths, *,
     adr_scale = np.ravel(adr.adr_model.get_scale(wavelengths)) / \
         adr.spaxel_size
     constants, grids = _model_constants(scene_model, psf)
+    mask_vectors, mask_radius = fourier_mask_arrays(scene_model)
     grid = scene_model.grid_info
     bases = np.asarray(build_polynomial_background_bases(
         grid["grid_x"], grid["grid_y"], degree))
@@ -585,7 +594,9 @@ def extract_psf(scene_model, images, variances, wavelengths, *,
             return np.concatenate([array[start:stop], filler])
         a = dict(wavelengths=padded(wavelengths, REFERENCE_WAVELENGTH),
                  adr_scale=padded(adr_scale, 0.0), grids=grids,
-                 profile_constants=constants, background_bases=bases)
+                 profile_constants=constants, background_bases=bases,
+                 mask_vectors=mask_vectors,
+                 mask_radius=np.asarray(mask_radius, dtype=np.float64))
         v, var = function(theta, a, padded(data, 0.0),
                           padded(inverse_variance, 1.0), **static)
         values.append(np.asarray(v)[:stop - start])

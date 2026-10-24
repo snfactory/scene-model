@@ -6,3 +6,4 @@ from .scene import *
 from .fit import *
 from .element import *
 from .models import *
+from .scala_mask import ScalaMaskPsfElement

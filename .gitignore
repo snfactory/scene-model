@@ -108,3 +108,6 @@ venv.bak/
 .mypy_cache/
 .dmypy.json
 dmypy.json
+
+# Daniel Kuesters' SCALA base vectors: installed locally, not published (see scene_model/data/README.md)
+scene_model/data/scala_base_vectors.*

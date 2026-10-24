@@ -18,3 +18,18 @@ All of the model parameters can be fit to real data, using any kind of priors on
 This code was heavily inspired by the extract_star.py code written for the SNIFS instrument by Yannick Copin, Clement Buton and Emmanuel Pecontal and borrows code in several places from it.
 
 Documentation is currently very lacking, although most classes and methods have detailed docstrings if you dig into the code. Contact me if you are interested in using this code.
+
+## SCALA pupil-mask instrumental core
+
+Stars of the SCALA programme are observed through the SCALA pupil mask, and
+Daniel Kuesters' SCALA reduction replaced the Gaussian instrumental core of
+`SnifsFourierSceneModel` by the analytic OTF of that mask in the 3D fit (his
+`MaskPsfElement`). That is now the option `inst_core='scala_mask'`
+(`SnifsFourierSceneModel`, `SnifsCubeFitter`) and `extract-star2 --inst-core
+scala_mask`, implemented in `scene_model/scala_mask.py` (NumPy element) and
+`jax_scene.fourier_source_pixels` (JAX fit, extraction and covariance). The 2D
+metaslice fits keep the Gaussian core, as in his code. The mask base vectors
+are read from `scene_model/data/scala_base_vectors.{npy,pkl}` or
+`$SCENE_MODEL_SCALA_BASE_VECTORS` (`--scala-base-vectors FILE`); production
+uses the first base vector only (`--scala-max-vectors 1`). Headers record
+`ES_CORE`, `ES_MSKN`, `ES_MSKR`. Tests: `tests/test_scala_mask.py`.

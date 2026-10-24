@@ -22,6 +22,8 @@ from .models import GaussianMoffatPsfElement, \
     GaussianSceneModel
 from .fit import MultipleImageFitter
 from .prior import MultivariateGaussianPrior
+from .scala_mask import ScalaMaskPsfElement, load_base_vectors, \
+    select_base_vectors, PRODUCTION_MAX_VECTORS, APERTURE_RADIUS
 from .covariance import assemble_flux_covariance, check_baseline_parity, \
     factor_covariance, finite_difference_jacobian, fixed_extraction_map, \
     JacobianDiagnostics, select_marginal_covariance
@@ -930,11 +932,23 @@ class SnifsFourierSceneModel(SceneModel):
 
     The background degree specifies which background model to use. See
     get_background_element for details.
+
+    inst_core selects the instrumental core: 'gaussian' (default) or
+    'scala_mask', the analytic OTF of the SCALA pupil mask (see scala_mask.py)
+    used for stars observed through that mask. The mask core is evaluated at
+    the model wavelength and therefore requires wavelength_dependence=True.
+    scala_base_vectors (n, 2) overrides the base vectors loaded from the
+    installed file; scala_max_vectors is the number of base vectors used
+    (production: 1).
     """
+    INST_CORES = ('gaussian', 'scala_mask')
+
     def __init__(self, image=None, variance=None,
                  use_empirical_parameters=True, wavelength_dependence=False,
                  background_degree=0, adr_model=None, spaxel_size=None,
-                 pressure=None, temperature=None, **kwargs):
+                 pressure=None, temperature=None, inst_core='gaussian',
+                 scala_base_vectors=None,
+                 scala_max_vectors=PRODUCTION_MAX_VECTORS, **kwargs):
         """Build the elements of the PSF model.
 
         If use_empirical_parameters is True, then the instrumental parameters
@@ -942,6 +956,11 @@ class SnifsFourierSceneModel(SceneModel):
         determined from the whole SNfactory standard star dataset.
         """
         self.wavelength_dependence = wavelength_dependence
+        if inst_core not in self.INST_CORES:
+            raise SceneModelException(
+                "Unknown instrumental core %r (choose from %s)"
+                % (inst_core, ", ".join(self.INST_CORES)))
+        self.inst_core = inst_core
 
         elements = []
 
@@ -949,12 +968,32 @@ class SnifsFourierSceneModel(SceneModel):
         point_source_element = PointSource()
         elements.append(point_source_element)
 
-        # Gaussian instrumental core
-        inst_core_element = GaussianPsfElement(
-            prefix='inst_core',
-            fits_keyword_prefix='C',
-            fits_description_prefix='Instrumental core',
-        )
+        if inst_core == 'scala_mask':
+            # SCALA pupil-mask instrumental core (Daniel Kuesters' SCALA
+            # reduction). Chromatic, no free parameters.
+            if not wavelength_dependence:
+                raise SceneModelException(
+                    "The SCALA mask instrumental core needs the wavelength: "
+                    "use it with wavelength_dependence=True")
+            if scala_base_vectors is None:
+                scala_base_vectors = load_base_vectors()
+            self.scala_base_vectors = select_base_vectors(
+                scala_base_vectors, max_vectors=scala_max_vectors)
+            inst_core_element = ScalaMaskPsfElement(
+                self.scala_base_vectors,
+                prefix='inst_core',
+                fits_keyword_prefix='C',
+                fits_description_prefix='Instrumental core',
+            )
+        else:
+            # Gaussian instrumental core
+            self.scala_base_vectors = None
+            inst_core_element = GaussianPsfElement(
+                prefix='inst_core',
+                fits_keyword_prefix='C',
+                fits_description_prefix='Instrumental core',
+            )
+        self.inst_core_element = inst_core_element
         elements.append(inst_core_element)
 
         # Exponential power function for instrumental wings
@@ -1021,14 +1060,18 @@ class SnifsFourierSceneModel(SceneModel):
         )
 
         if use_empirical_parameters:
-            self.fix(
-                inst_core_sigma_x=0.2376935 * np.sqrt(2),
-                inst_core_sigma_y=0.154173 * np.sqrt(2),
-                inst_core_rho=0.,
+            empirical = dict(
                 inst_wings_power=1.07,
                 inst_wings_width=0.209581,
                 seeing_power=1.52,
             )
+            if inst_core == 'gaussian':
+                empirical.update(
+                    inst_core_sigma_x=0.2376935 * np.sqrt(2),
+                    inst_core_sigma_y=0.154173 * np.sqrt(2),
+                    inst_core_rho=0.,
+                )
+            self.fix(**empirical)
 
     def get_fits_header_items(self, prefix=config.default_fits_prefix):
         """Get a list of parameters to put into the fits header.
@@ -1048,6 +1091,13 @@ class SnifsFourierSceneModel(SceneModel):
         if self.wavelength_dependence:
             fits_list.append((prefix + 'SPXSZ', self.adr_element.spaxel_size,
                               'Spaxel size'))
+        fits_list.append((prefix + 'CORE', self.inst_core,
+                          'Instrumental core model'))
+        if self.inst_core == 'scala_mask':
+            fits_list.append((prefix + 'MSKN', len(self.scala_base_vectors),
+                              'SCALA mask base vectors used'))
+            fits_list.append((prefix + 'MSKR', self.inst_core_element.radius,
+                              'SCALA mask aperture radius'))
 
         return fits_list
 
@@ -1061,6 +1111,12 @@ class SnifsFourierSceneModel(SceneModel):
         """
         wavelength_dependence = fits_header[prefix + 'WDEP']
         background_degree = fits_header[prefix + 'SDEG']
+        # Headers written before the instrumental core became selectable
+        # have no CORE key: they are Gaussian-core models.
+        inst_core = fits_header.get(prefix + 'CORE', 'gaussian')
+        core_kwargs = {}
+        if inst_core == 'scala_mask':
+            core_kwargs['scala_max_vectors'] = fits_header[prefix + 'MSKN']
 
         if wavelength_dependence:
             spaxel_size = fits_header[prefix + 'SPXSZ']
@@ -1071,14 +1127,25 @@ class SnifsFourierSceneModel(SceneModel):
                 background_degree=background_degree,
                 spaxel_size=spaxel_size,
                 pressure=pressure,
-                temperature=temperature
+                temperature=temperature,
+                inst_core=inst_core,
+                **core_kwargs
             )
         else:
             scene_model = cls(
                 use_empirical_parameters=False,
                 wavelength_dependence=False,
-                background_degree=background_degree
+                background_degree=background_degree,
+                inst_core=inst_core,
+                **core_kwargs
             )
+        if inst_core == 'scala_mask':
+            radius = fits_header.get(prefix + 'MSKR', APERTURE_RADIUS)
+            if abs(radius - scene_model.inst_core_element.radius) > 1e-12:
+                raise SceneModelException(
+                    "Header SCALA mask aperture radius %r differs from the "
+                    "installed value %r" % (radius,
+                                            scene_model.inst_core_element.radius))
 
         # Read in the rest of the parameters
         scene_model.load_fits_header(fits_header, prefix=prefix,
@@ -1272,7 +1339,9 @@ class SnifsCubeFitter(object):
                  subsampling=config.default_subsampling,
                  border=config.default_border, least_squares=False,
                  filter_variance=False, prior_scale=0., seeing_prior=None,
-                 accountant=None, verbosity=0, fit_backend='numpy'):
+                 accountant=None, verbosity=0, fit_backend='numpy',
+                 inst_core='gaussian', scala_base_vectors=None,
+                 scala_max_vectors=PRODUCTION_MAX_VECTORS):
         """Initialize the fitter.
 
         path is the path to the fits cube that will be extracted.
@@ -1280,6 +1349,13 @@ class SnifsCubeFitter(object):
         fit_backend='jax' fits the 2D/3D metaslice models with exact JAX
         gradients and computes their covariances from exact JAX Hessians
         (see jax_fit); 'numpy' keeps the finite-difference reference path.
+
+        inst_core selects the instrumental core of the Fourier PSF (see
+        SnifsFourierSceneModel). 'scala_mask' applies to the 3D (wavelength
+        dependent) fit and hence to the extraction; the 2D metaslice fits
+        keep the Gaussian core, as in Daniel Kuesters' SCALA reduction.
+        scala_base_vectors / scala_max_vectors configure the mask; the base
+        vectors default to the installed file (scala_mask.load_base_vectors).
         """
         from .fit import check_fit_backend
         self.verbosity = verbosity
@@ -1291,7 +1367,9 @@ class SnifsCubeFitter(object):
 
         self._read_cube(path)
         self._setup_psf(psf, prior_scale=prior_scale,
-                        seeing_prior=seeing_prior)
+                        seeing_prior=seeing_prior, inst_core=inst_core,
+                        scala_base_vectors=scala_base_vectors,
+                        scala_max_vectors=scala_max_vectors)
 
         self.background_degree = background_degree
         self.subsampling = subsampling
@@ -1385,11 +1463,24 @@ class SnifsCubeFitter(object):
         self.adr_model = adr_model
         self.original_adr_model = deepcopy(adr_model)
 
-    def _setup_psf(self, psf, prior_scale=0., seeing_prior=None):
+    def _setup_psf(self, psf, prior_scale=0., seeing_prior=None,
+                   inst_core='gaussian', scala_base_vectors=None,
+                   scala_max_vectors=PRODUCTION_MAX_VECTORS):
         """Set up a PSF to be fit. All PSF specific configuration should happen
         here.
         """
         scene_model_kwargs = {}
+        # Keyword arguments for the 3D (wavelength dependent) model only.
+        scene_model_kwargs_3d = {}
+
+        if inst_core not in SnifsFourierSceneModel.INST_CORES:
+            raise SceneModelException(
+                "Unknown instrumental core %r (choose from %s)"
+                % (inst_core, ", ".join(SnifsFourierSceneModel.INST_CORES)))
+        if inst_core != 'gaussian' and psf != "fourier":
+            raise SceneModelException(
+                "The instrumental core is selectable for the Fourier PSF "
+                "only (psf=%r)" % psf)
 
         # Pick the PSF to fit
         if psf == "fourier":
@@ -1398,6 +1489,15 @@ class SnifsCubeFitter(object):
             seeing_key = 'seeing_width'
             seeing_powerlaw_keys = ['seeing_ref_power', 'seeing_ref_width']
             global_fit_keys = ['ellipticity_x', 'ellipticity_y']
+            if inst_core == 'scala_mask':
+                # Load once, here, so a missing base-vector file fails before
+                # any fitting; the 3D model then selects from these.
+                if scala_base_vectors is None:
+                    scala_base_vectors = load_base_vectors()
+                scene_model_kwargs_3d['inst_core'] = inst_core
+                scene_model_kwargs_3d['scala_base_vectors'] = \
+                    scala_base_vectors
+                scene_model_kwargs_3d['scala_max_vectors'] = scala_max_vectors
         elif psf == "classic":
             scene_model_class = SnifsClassicSceneModel
             seeing_degree = 2
@@ -1445,6 +1545,7 @@ class SnifsCubeFitter(object):
                 self.seeing_prior_object = seeing_prior_object
 
         self.psf = psf
+        self.inst_core = inst_core
         self.prior_scale = prior_scale
         self.seeing_prior = seeing_prior
         self.individual_priors = individual_priors
@@ -1455,6 +1556,7 @@ class SnifsCubeFitter(object):
         self.seeing_powerlaw_keys = seeing_powerlaw_keys
         self.global_fit_keys = global_fit_keys
         self.scene_model_kwargs = scene_model_kwargs
+        self.scene_model_kwargs_3d = scene_model_kwargs_3d
 
     def print_cube_info(self):
         """Print information about the cube and the model that will be fit to
@@ -1474,6 +1576,9 @@ class SnifsCubeFitter(object):
 
         self.print_message("  PSF: %s, subsampling: %d, border: %d" %
                            (self.psf, self.subsampling, self.border))
+        if self.inst_core != 'gaussian':
+            self.print_message("  Instrumental core (3D fit): %s" %
+                               self.inst_core)
 
         if self.background_degree > 0:
             self.print_message("  Sky: polynomial, degree %d" %
@@ -1779,7 +1884,7 @@ class SnifsCubeFitter(object):
             border=self.border,
             adr_model=self.adr_model,
             spaxel_size=self.cube.spxSize,
-            **self.scene_model_kwargs
+            **dict(self.scene_model_kwargs, **self.scene_model_kwargs_3d)
         )
 
         meta_cube_data, meta_cube_var = cube_to_arrays(self.meta_cube)
@@ -2232,7 +2337,6 @@ class SnifsCubeFitter(object):
                 from .jax_scene import (
                     CLASSIC_PARAMETER_NAMES,
                     FOURIER_PARAMETER_NAMES,
-                    FOURIER_PROFILE_NAMES,
                     PRODUCTION_WAVELENGTH_BATCH,
                     build_classic_fixed_arrays,
                     build_fourier_fixed_arrays,
@@ -2243,6 +2347,8 @@ class SnifsCubeFitter(object):
                     flux_and_jacobian_folded,
                     fourier_flux,
                     fourier_flux_jacobian,
+                    fourier_mask_arrays,
+                    fourier_profile_constants,
                 )
 
                 # With the JAX fit backend, differentiate the folded model
@@ -2317,14 +2423,16 @@ class SnifsCubeFitter(object):
                             "Fourier-domain JAX parameter names differ from "
                             "the production fit"
                         )
-                    profile_constants = {
-                        name: evaluation_model.parameters[name]
-                        for name in FOURIER_PROFILE_NAMES
-                    }
+                    profile_constants = fourier_profile_constants(
+                        evaluation_model.parameters,
+                        evaluation_model.inst_core)
+                    mask_vectors, mask_radius = fourier_mask_arrays(
+                        evaluation_model)
                     fixed_jax = build_fourier_fixed_arrays(
                         fixed_data, fixed_variance, fixed_wavelength,
                         adr_scale, evaluation_model.grid_info,
                         background_bases, profile_constants,
+                        mask_vectors=mask_vectors, mask_radius=mask_radius,
                     )
                     if jax_wavelength_batch is None and folded:
                         jax_flux, jacobian = flux_and_jacobian_folded(

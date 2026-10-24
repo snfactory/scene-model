@@ -84,6 +84,22 @@ if __name__ == "__main__":
     parser.add_option("--no-jax-wavelength-batching",
                       dest="jax_wavelength_batching", action="store_false",
                       help="Disable JAX wavelength batching")
+    parser.add_option("--inst-core", dest="inst_core",
+                      choices=('gaussian', 'scala_mask'), default='gaussian',
+                      help="Instrumental core of the Fourier PSF: 'gaussian' "
+                      "(default) or 'scala_mask', the analytic OTF of the "
+                      "SCALA pupil mask, applied in the 3D fit and the "
+                      "extraction (stars observed through the mask) "
+                      "[%default]")
+    parser.add_option("--scala-base-vectors", dest="scala_base_vectors",
+                      type=str, default=None,
+                      help="SCALA mask base-vector file (.npy or Daniel "
+                      "Kuesters' base_vectors_python2.pkl); default: "
+                      "$SCENE_MODEL_SCALA_BASE_VECTORS or the installed file")
+    parser.add_option("--scala-max-vectors", dest="scala_max_vectors",
+                      type=int, default=1,
+                      help="Number of SCALA mask base vectors to use "
+                      "(production: 1) [%default]")
     parser.add_option("--fit-backend", dest="fit_backend",
                       choices=("numpy", "jax"), default="numpy",
                       help="Metaslice fit gradients/Hessians: numpy finite "
@@ -174,6 +190,15 @@ if __name__ == "__main__":
     else:
         accountant = None
 
+    # SCALA mask base vectors, if a file was given explicitly.
+    scala_base_vectors = None
+    if opts.scala_base_vectors is not None:
+        from scene_model.scala_mask import load_base_vectors
+        try:
+            scala_base_vectors = load_base_vectors(opts.scala_base_vectors)
+        except scene_model.SceneModelException as e:
+            parser.error(str(e))
+
     # Load the data cube into the fitter.
     try:
         fitter = snifs_scene.SnifsCubeFitter(
@@ -189,6 +214,9 @@ if __name__ == "__main__":
             accountant=accountant,
             verbosity=opts.verbosity,
             fit_backend=opts.fit_backend,
+            inst_core=opts.inst_core,
+            scala_base_vectors=scala_base_vectors,
+            scala_max_vectors=opts.scala_max_vectors,
         )
     except scene_model.SceneModelException as e:
         parser.error(str(e))
